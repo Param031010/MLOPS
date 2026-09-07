@@ -151,7 +151,19 @@ def main() -> None:
                    local_authority_ons_district, local_authority_highway, police_force,
                    urban_or_rural_area, street_name
             FROM tmp_accidents_staged
-            ON CONFLICT (latitude, longitude) DO NOTHING
+            -- Not DO NOTHING: TomTom's quota is spent a few hundred coordinates
+            -- per run, so later runs legitimately carry street names for
+            -- coordinates that are already in the dimension. DO NOTHING silently
+            -- discarded every one of those, freezing road-context coverage at
+            -- whatever the first load happened to resolve. COALESCE keeps an
+            -- existing name when a rerun has no enrichment for that coordinate,
+            -- so coverage only ever moves up.
+            ON CONFLICT (latitude, longitude) DO UPDATE SET
+                street_name = COALESCE(EXCLUDED.street_name, dim_location.street_name),
+                road_context_resolved_at = CASE
+                    WHEN EXCLUDED.street_name IS NOT NULL THEN now()
+                    ELSE dim_location.road_context_resolved_at
+                END
         """))
 
         road_cols_sql = ", ".join(ROAD_COLS)
