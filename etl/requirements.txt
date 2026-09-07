@@ -1,0 +1,7 @@
+pandas==2.2.3
+pyarrow==18.1.0
+requests==2.32.3
+python-dotenv==1.0.1
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.10
+tenacity==9.0.0
