@@ -1,0 +1,36 @@
+# The image is built from the repository root (so the Dockerfile can copy
+# backend/app, ml/ and etl/stats19_lookups.py together), which would otherwise
+# send several GB of virtualenvs, source CSVs and MLflow runs to the daemon as
+# build context. Everything the image actually needs is listed in the
+# Dockerfile's COPY lines; everything below is excluded.
+
+# secrets -- the container gets its configuration from --env-file at run time
+.env
+
+# virtualenvs (~2.3GB)
+**/.venv/
+**/venv/
+
+# source and intermediate data (~500MB) -- the API reads Postgres, not files
+dataset/
+etl/data/
+
+# MLflow tracking store: the model is resolved from MLFLOW_TRACKING_URI at
+# runtime, not baked into the image
+ml/mlruns/
+ml/mlartifacts/
+
+# python / tooling noise
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+.git/
+.gitignore
+.streamlit/
+
+# not part of the inference service
+dashboard/
+sql/
+docs/
+airflow/
+*.md

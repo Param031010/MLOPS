@@ -39,7 +39,7 @@ TRAIN_QUERY = """
     SELECT fa.accident_index, fa.severity_id, fa.number_of_vehicles,
            d.full_date, d.hour, d.day_of_week, d.month, d.is_weekend,
            r.road_type, r.speed_limit, r.junction_detail,
-           l.urban_or_rural_area,
+           l.urban_or_rural_area, l.latitude, l.longitude,
            w.light_conditions, w.weather_conditions, w.road_surface_conditions,
            w.temperature_c, w.precipitation_mm
     FROM fact_accidents fa
@@ -84,21 +84,45 @@ def chronological_split(df: pd.DataFrame, train_frac=0.70, val_frac=0.15):
     return df.iloc[:train_end], df.iloc[train_end:val_end], df.iloc[val_end:]
 
 
+def decile_profile(series: pd.Series) -> dict | None:
+    """Decile edges + the training set's share of rows in each bucket.
+
+    This is the shape /monitoring/drift's PSI computation expects, so anything
+    profiled this way -- a model feature or a coordinate -- is comparable
+    against live data with the same code path.
+    """
+    series = series.dropna().astype(float)
+    if series.empty:
+        return None
+    edges = np.quantile(series, np.linspace(0.1, 0.9, 9)).tolist()
+    counts, _ = np.histogram(series, bins=[-np.inf, *edges, np.inf])
+    return {
+        "mean": float(series.mean()),
+        "std": float(series.std()),
+        "decile_edges": edges,
+        "decile_props": (counts / counts.sum()).tolist(),
+    }
+
+
 def numeric_feature_baseline(train_df: pd.DataFrame) -> dict:
     stats = {}
     for col in NUMERIC_COLUMNS:
-        series = train_df[col].dropna().astype(float)
-        if series.empty:
-            continue
-        edges = np.quantile(series, np.linspace(0.1, 0.9, 9)).tolist()
-        counts, _ = np.histogram(series, bins=[-np.inf, *edges, np.inf])
-        props = (counts / counts.sum()).tolist()
-        stats[col] = {
-            "mean": float(series.mean()),
-            "std": float(series.std()),
-            "decile_edges": edges,
-            "decile_props": props,
-        }
+        profile = decile_profile(train_df[col])
+        if profile is not None:
+            stats[col] = profile
+    return stats
+
+
+def location_baseline(train_df: pd.DataFrame) -> dict:
+    """Latitude/longitude profile of the training set, so location drift is
+    measurable: a model fitted mostly on one part of the country and later
+    scored on another shows up as a PSI shift on these two columns even when
+    every model feature looks stable."""
+    stats = {}
+    for col in ["latitude", "longitude"]:
+        profile = decile_profile(train_df[col])
+        if profile is not None:
+            stats[col] = profile
     return stats
 
 
@@ -217,6 +241,7 @@ def main() -> None:
         "metrics": best["test_metrics"],
         "class_labels": classes,
         "numeric_feature_stats": numeric_feature_baseline(train_df),
+        "location_stats": location_baseline(train_df),
         "class_distribution": pd.Series(y_train).value_counts(normalize=True).to_dict(),
     }
     (ARTIFACTS_DIR / "baseline.json").write_text(json.dumps(baseline, indent=2, default=str))

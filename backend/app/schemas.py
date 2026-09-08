@@ -162,11 +162,27 @@ class ModelHealth(BaseModel):
 
 
 class DriftReport(BaseModel):
+    # kind distinguishes the three drift families the project monitors:
+    # "feature" (model inputs), "location" (where accidents are happening) and
+    # "class" (the severity mix itself). For class rows, baseline_value /
+    # current_value are shares of that class rather than means.
+    kind: str  # feature | location | class
     feature: str
-    baseline_mean: Optional[float] = None
-    current_mean: Optional[float] = None
+    baseline_value: Optional[float] = None
+    current_value: Optional[float] = None
     psi: Optional[float] = None
     drifted: bool
+
+
+class LatencyReport(BaseModel):
+    sampled_requests: int
+    predictions_served: int
+    failures: int
+    failure_rate: float
+    p50_ms: Optional[float] = None
+    p95_ms: Optional[float] = None
+    p99_ms: Optional[float] = None
+    max_ms: Optional[float] = None
 
 
 class PerformanceReport(BaseModel):

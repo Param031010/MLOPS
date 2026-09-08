@@ -8,6 +8,8 @@ import json
 import math
 import os
 import sys
+import time
+from collections import deque
 from pathlib import Path
 
 import mlflow
@@ -19,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from ..db import fetch_all, get_connection
 from ..schemas import (
     DriftReport,
+    LatencyReport,
     ModelHealth,
     ModelInfo,
     PerformanceReport,
@@ -45,6 +48,38 @@ router = APIRouter(tags=["predict"])
 
 MODEL_NAME = "traffic_severity_classifier"
 BASELINE_PATH = ML_DIR / "artifacts" / "baseline.json"
+
+
+class LatencyTracker:
+    """Rolling in-process record of inference latency and failures.
+
+    Deliberately in-memory and bounded: this is a demonstration of serving
+    telemetry, not a metrics backend. It resets when the process restarts, and
+    a real deployment would export these to Prometheus/OpenTelemetry instead.
+    """
+
+    def __init__(self, maxlen: int = 500) -> None:
+        self.samples: deque[float] = deque(maxlen=maxlen)
+        self.served = 0
+        self.failures = 0
+
+    def record(self, elapsed_ms: float) -> None:
+        self.samples.append(elapsed_ms)
+        self.served += 1
+
+    def record_failure(self) -> None:
+        self.failures += 1
+
+    def percentile(self, pct: float) -> float | None:
+        if not self.samples:
+            return None
+        ordered = sorted(self.samples)
+        # nearest-rank: index of the first value at or above the percentile
+        idx = min(int(math.ceil(pct / 100 * len(ordered))) - 1, len(ordered) - 1)
+        return round(ordered[max(idx, 0)], 2)
+
+
+latency = LatencyTracker()
 
 
 class ModelState:
@@ -93,10 +128,13 @@ async def predict(req: PredictRequest):
     feat = build_features(req.model_dump())
     row = pd.DataFrame([feat])[FEATURE_COLUMNS]
 
+    started = time.perf_counter()
     try:
         proba = model.predict(row)
     except Exception as exc:  # noqa: BLE001
+        latency.record_failure()
         raise HTTPException(status_code=500, detail=f"Model inference failed: {exc}") from exc
+    latency.record((time.perf_counter() - started) * 1000)
 
     proba_arr = np.asarray(proba)
     if proba_arr.ndim == 2 and state.baseline:
@@ -151,35 +189,115 @@ def _psi(baseline_edges: list[float], baseline_props: list[float], current: pd.S
     return float(psi)
 
 
+def _class_psi_terms(baseline_dist: dict, current: pd.Series) -> dict[int, tuple[float, float, float]]:
+    """Per-class (baseline share, current share, PSI contribution).
+
+    PSI is a sum of independent per-bucket terms, so reporting them per class
+    shows *which* severity moved, not just that something did.
+    """
+    current_shares = current.value_counts(normalize=True)
+    terms: dict[int, tuple[float, float, float]] = {}
+    for raw_label, baseline_share in baseline_dist.items():
+        label = int(raw_label)
+        b = max(float(baseline_share), 1e-4)
+        c = max(float(current_shares.get(label, 0.0)), 1e-4)
+        terms[label] = (float(baseline_share), float(current_shares.get(label, 0.0)),
+                        (c - b) * math.log(c / b))
+    return terms
+
+
+SEVERITY_LABELS = {1: "Fatal", 2: "Serious", 3: "Slight", -1: "Data missing"}
+
+
 @router.get("/monitoring/drift", response_model=list[DriftReport])
 async def monitoring_drift(conn: AsyncConnection = Depends(get_connection)):
+    """Feature, location and class drift of the most recent accidents against
+    the training baseline, all measured as PSI (>0.2 = retrain, per
+    ml/RETRAINING.md)."""
     if state.baseline is None:
         raise HTTPException(status_code=503, detail="No training baseline available yet")
 
     rows = await fetch_all(conn, """
-        SELECT fa.number_of_vehicles, d.hour, d.day_of_week, d.month, r.speed_limit,
-               w.temperature_c, w.precipitation_mm
+        SELECT fa.severity_id, fa.number_of_vehicles, d.hour, d.day_of_week, d.month,
+               r.speed_limit, w.temperature_c, w.precipitation_mm,
+               l.latitude, l.longitude
         FROM fact_accidents fa
         JOIN dim_date d ON d.date_key = fa.date_key
         JOIN dim_road r ON r.road_id = fa.road_id
         JOIN dim_weather w ON w.weather_id = fa.weather_id
-        ORDER BY fa.loaded_at DESC
+        JOIN dim_location l ON l.location_id = fa.location_id
+        -- Most recent accidents by when they happened. loaded_at is
+        -- identical across a bulk load, so ordering by it would return an
+        -- arbitrary slice of physical row order rather than a time window.
+        ORDER BY d.full_date DESC, fa.accident_index DESC
         LIMIT 2000
     """)
     current = pd.DataFrame(rows)
-    reports = []
+    reports: list[DriftReport] = []
+    if current.empty:
+        return reports
+
+    # --- model input drift ---
     for feature, stats in state.baseline.get("numeric_feature_stats", {}).items():
         if feature not in current.columns:
             continue
         psi = _psi(stats["decile_edges"], stats["decile_props"], current[feature])
         reports.append(DriftReport(
-            feature=feature,
-            baseline_mean=stats.get("mean"),
-            current_mean=float(current[feature].mean()) if not current.empty else None,
-            psi=round(psi, 4),
-            drifted=psi > 0.2,
+            kind="feature", feature=feature,
+            baseline_value=stats.get("mean"),
+            current_value=float(current[feature].mean()),
+            psi=round(psi, 4), drifted=psi > 0.2,
         ))
+
+    # --- location drift: are accidents arriving from a different geography? ---
+    for feature, stats in state.baseline.get("location_stats", {}).items():
+        if feature not in current.columns:
+            continue
+        series = pd.to_numeric(current[feature], errors="coerce")
+        psi = _psi(stats["decile_edges"], stats["decile_props"], series)
+        reports.append(DriftReport(
+            kind="location", feature=feature,
+            baseline_value=stats.get("mean"),
+            current_value=float(series.mean()),
+            psi=round(psi, 4), drifted=psi > 0.2,
+        ))
+
+    # --- class drift: has the severity mix itself shifted? ---
+    baseline_dist = state.baseline.get("class_distribution") or {}
+    if baseline_dist and "severity_id" in current.columns:
+        terms = _class_psi_terms(baseline_dist, current["severity_id"])
+        total_psi = sum(t[2] for t in terms.values())
+        for label, (baseline_share, current_share, term) in sorted(terms.items()):
+            reports.append(DriftReport(
+                kind="class",
+                feature=f"severity: {SEVERITY_LABELS.get(label, label)}",
+                baseline_value=round(baseline_share, 4),
+                current_value=round(current_share, 4),
+                psi=round(term, 4),
+                # the retrain decision is about the distribution as a whole,
+                # so every class row carries the same verdict
+                drifted=total_psi > 0.2,
+            ))
+
     return reports
+
+
+@router.get("/monitoring/latency", response_model=LatencyReport)
+async def monitoring_latency():
+    """Serving telemetry for /predict: inference latency percentiles and the
+    failure count, both required by the monitoring brief alongside drift and
+    model performance."""
+    total_attempts = latency.served + latency.failures
+    return LatencyReport(
+        sampled_requests=len(latency.samples),
+        predictions_served=latency.served,
+        failures=latency.failures,
+        failure_rate=round(latency.failures / total_attempts, 4) if total_attempts else 0.0,
+        p50_ms=latency.percentile(50),
+        p95_ms=latency.percentile(95),
+        p99_ms=latency.percentile(99),
+        max_ms=round(max(latency.samples), 2) if latency.samples else None,
+    )
 
 
 @router.get("/monitoring/performance", response_model=PerformanceReport)
@@ -196,7 +314,10 @@ async def monitoring_performance(conn: AsyncConnection = Depends(get_connection)
         JOIN dim_road r ON r.road_id = fa.road_id
         JOIN dim_weather w ON w.weather_id = fa.weather_id
         JOIN dim_location l ON l.location_id = fa.location_id
-        ORDER BY fa.loaded_at DESC
+        -- Score the newest accidents, which fall in the chronological
+        -- test split -- ordering by loaded_at would mix training rows in
+        -- and report a rosier macro-F1 than the model actually earns.
+        ORDER BY d.full_date DESC, fa.accident_index DESC
         LIMIT 1000
     """)
     if not rows:

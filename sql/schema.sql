@@ -412,3 +412,130 @@ BEGIN
     REFRESH MATERIALIZED VIEW mart_vehicles_by_type;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- DATA DICTIONARY
+-- ============================================================
+-- Column descriptions live in the database itself, so `\d+ <table>` in psql
+-- shows them and docs/generate_data_dictionary.py can emit the submitted data
+-- dictionary straight from the live schema, instead of a hand-maintained copy
+-- that silently drifts out of date.
+
+COMMENT ON TABLE  dim_severity IS 'Severity lookup, seeded from STATS19 codes. -1 is STATS19''s own "data missing or out of range" value, kept as a labelled category rather than dropped.';
+COMMENT ON COLUMN dim_severity.severity_id IS 'STATS19 severity code: 1=Fatal, 2=Serious, 3=Slight, -1=Data missing.';
+COMMENT ON COLUMN dim_severity.severity_label IS 'Human-readable severity label.';
+
+COMMENT ON TABLE  dim_date IS 'Date + hour grain. One row per distinct hour in which a collision occurred.';
+COMMENT ON COLUMN dim_date.date_key IS 'Surrogate key, format YYYYMMDDHH (e.g. 2025063017 = 17:00 on 30 June 2025).';
+COMMENT ON COLUMN dim_date.full_date IS 'Calendar date of the collision.';
+COMMENT ON COLUMN dim_date.hour IS 'Hour of day, 0-23, from the STATS19 time field.';
+COMMENT ON COLUMN dim_date.day_of_week IS 'STATS19 day numbering: 1=Sunday through 7=Saturday.';
+COMMENT ON COLUMN dim_date.day_name IS 'Decoded day name.';
+COMMENT ON COLUMN dim_date.day_of_month IS 'Day of month, 1-31.';
+COMMENT ON COLUMN dim_date.month IS 'Month number, 1-12.';
+COMMENT ON COLUMN dim_date.month_name IS 'Month name.';
+COMMENT ON COLUMN dim_date.quarter IS 'Calendar quarter, 1-4.';
+COMMENT ON COLUMN dim_date.year IS 'Calendar year.';
+COMMENT ON COLUMN dim_date.is_weekend IS 'True for Saturday and Sunday (STATS19 codes 7 and 1).';
+
+COMMENT ON TABLE  dim_location IS 'One row per distinct collision coordinate, enriched with TomTom street context where quota allowed.';
+COMMENT ON COLUMN dim_location.location_id IS 'Surrogate key.';
+COMMENT ON COLUMN dim_location.latitude IS 'WGS84 latitude. Validated against Great Britain''s bounding box (49.8 to 60.9).';
+COMMENT ON COLUMN dim_location.longitude IS 'WGS84 longitude. Validated against Great Britain''s bounding box (-8.6 to 1.8).';
+COMMENT ON COLUMN dim_location.location_easting_osgr IS 'OS grid reference easting, as supplied by STATS19.';
+COMMENT ON COLUMN dim_location.location_northing_osgr IS 'OS grid reference northing, as supplied by STATS19.';
+COMMENT ON COLUMN dim_location.lsoa_of_accident_location IS 'Lower Layer Super Output Area code of the collision location.';
+COMMENT ON COLUMN dim_location.local_authority_district IS 'Local authority district name.';
+COMMENT ON COLUMN dim_location.local_authority_ons_district IS 'ONS code for the local authority district.';
+COMMENT ON COLUMN dim_location.local_authority_highway IS 'Highway authority responsible for the road.';
+COMMENT ON COLUMN dim_location.police_force IS 'Police force area reporting the collision.';
+COMMENT ON COLUMN dim_location.urban_or_rural_area IS 'Decoded STATS19 classification: Urban, Rural, Unallocated or Data missing.';
+COMMENT ON COLUMN dim_location.street_name IS 'Street name from TomTom reverse geocoding. NULL where the free-tier quota has not yet reached this coordinate; coverage is reported by /accidents/overview rather than hidden.';
+COMMENT ON COLUMN dim_location.road_context_resolved_at IS 'When the street name was last resolved, stamped by the load that first learned it.';
+
+COMMENT ON TABLE  dim_road IS 'Junk dimension over the road-configuration attributes of a collision.';
+COMMENT ON COLUMN dim_road.road_id IS 'Surrogate key.';
+COMMENT ON COLUMN dim_road.first_road_class IS 'Decoded class of the primary road (Motorway, A(M), A, B, C, Unclassified).';
+COMMENT ON COLUMN dim_road.road_type IS 'Decoded carriageway layout (Single carriageway, Dual carriageway, Roundabout, Slip road, ...).';
+COMMENT ON COLUMN dim_road.speed_limit IS 'Posted speed limit in mph at the collision location.';
+COMMENT ON COLUMN dim_road.junction_detail IS 'Decoded junction type, or "Not at junction or within 20 metres".';
+COMMENT ON COLUMN dim_road.junction_control IS 'Decoded control at the junction (auto traffic signal, give way, stop sign, ...).';
+COMMENT ON COLUMN dim_road.second_road_class IS 'Decoded class of the second road where the collision was at a junction.';
+COMMENT ON COLUMN dim_road.pedestrian_crossing IS 'Decoded pedestrian crossing facility within 50 metres.';
+COMMENT ON COLUMN dim_road.special_conditions_at_site IS 'Decoded site defects such as defective signals or an obscured sign.';
+COMMENT ON COLUMN dim_road.carriageway_hazards IS 'Decoded carriageway hazards such as an object in the road or a previous accident.';
+COMMENT ON COLUMN dim_road.trunk_road_flag IS 'Whether the road is a trunk road.';
+
+COMMENT ON TABLE  dim_weather IS 'Junk dimension combining police-observed STATS19 conditions with Open-Meteo measurements for the collision hour.';
+COMMENT ON COLUMN dim_weather.weather_id IS 'Surrogate key.';
+COMMENT ON COLUMN dim_weather.weather_conditions IS 'Decoded STATS19 weather as recorded by the attending officer.';
+COMMENT ON COLUMN dim_weather.road_surface_conditions IS 'Decoded STATS19 road surface state (Dry, Wet or damp, Snow, Frost or ice, Flood).';
+COMMENT ON COLUMN dim_weather.light_conditions IS 'Decoded STATS19 lighting at the time of the collision.';
+COMMENT ON COLUMN dim_weather.temperature_c IS 'Open-Meteo 2m air temperature in Celsius for the collision hour and grid cell. NULL where that grid cell has not been backfilled yet.';
+COMMENT ON COLUMN dim_weather.precipitation_mm IS 'Open-Meteo precipitation in millimetres for the collision hour.';
+COMMENT ON COLUMN dim_weather.wind_speed_kmh IS 'Open-Meteo 10m wind speed in km/h for the collision hour.';
+COMMENT ON COLUMN dim_weather.weather_code_meteo IS 'Open-Meteo WMO weather interpretation code.';
+COMMENT ON COLUMN dim_weather.is_raining IS 'Derived: precipitation greater than zero.';
+COMMENT ON COLUMN dim_weather.is_freezing IS 'Derived: temperature at or below zero Celsius.';
+
+COMMENT ON TABLE  fact_accidents IS 'Fact table at collision grain: exactly one row per STATS19 collision that survived validation.';
+COMMENT ON COLUMN fact_accidents.accident_key IS 'Surrogate key.';
+COMMENT ON COLUMN fact_accidents.accident_index IS 'Business key, from the source collision_index. Unique, and the conflict target of the load''s upsert.';
+COMMENT ON COLUMN fact_accidents.date_key IS 'Foreign key to dim_date.';
+COMMENT ON COLUMN fact_accidents.location_id IS 'Foreign key to dim_location.';
+COMMENT ON COLUMN fact_accidents.road_id IS 'Foreign key to dim_road.';
+COMMENT ON COLUMN fact_accidents.weather_id IS 'Foreign key to dim_weather.';
+COMMENT ON COLUMN fact_accidents.severity_id IS 'Foreign key to dim_severity. The classification target for the Part 2 model.';
+COMMENT ON COLUMN fact_accidents.number_of_vehicles IS 'Vehicles involved in the collision.';
+COMMENT ON COLUMN fact_accidents.number_of_casualties IS 'People injured in the collision.';
+COMMENT ON COLUMN fact_accidents.police_force IS 'Reporting police force.';
+COMMENT ON COLUMN fact_accidents.did_police_officer_attend IS 'Decoded: whether an officer attended the scene.';
+COMMENT ON COLUMN fact_accidents.source_year IS 'Year of the source STATS19 export the row came from.';
+COMMENT ON COLUMN fact_accidents.loaded_at IS 'When the row was written by load.py.';
+
+COMMENT ON TABLE  fact_casualties IS 'Fact table at casualty grain: one row per injured person. A separate grain from fact_accidents, because one collision injures several people who each have their own severity.';
+COMMENT ON COLUMN fact_casualties.casualty_key IS 'Surrogate key.';
+COMMENT ON COLUMN fact_casualties.accident_index IS 'Foreign key to fact_accidents.accident_index.';
+COMMENT ON COLUMN fact_casualties.vehicle_reference IS 'Which vehicle in the collision the casualty was associated with.';
+COMMENT ON COLUMN fact_casualties.casualty_reference IS 'Casualty number within the collision.';
+COMMENT ON COLUMN fact_casualties.casualty_class IS 'Decoded: Driver or rider, Passenger, or Pedestrian.';
+COMMENT ON COLUMN fact_casualties.sex_of_casualty IS 'Decoded sex of the casualty.';
+COMMENT ON COLUMN fact_casualties.age_of_casualty IS 'Age in years; -1 where STATS19 recorded it as missing.';
+COMMENT ON COLUMN fact_casualties.age_band_of_casualty IS 'Decoded age band.';
+COMMENT ON COLUMN fact_casualties.casualty_severity_id IS 'Foreign key to dim_severity: this person''s injury severity, which may differ from the collision''s overall severity.';
+COMMENT ON COLUMN fact_casualties.pedestrian_location IS 'Decoded pedestrian location relative to the carriageway.';
+COMMENT ON COLUMN fact_casualties.pedestrian_movement IS 'Decoded pedestrian movement at the time of impact.';
+COMMENT ON COLUMN fact_casualties.car_passenger IS 'Decoded: front seat, rear seat, or not a car passenger.';
+COMMENT ON COLUMN fact_casualties.bus_or_coach_passenger IS 'Decoded bus or coach passenger status.';
+COMMENT ON COLUMN fact_casualties.casualty_type IS 'Decoded road-user type (Car occupant, Pedestrian, Cyclist, Motorcycle rider, ...).';
+COMMENT ON COLUMN fact_casualties.casualty_imd_decile IS 'Index of Multiple Deprivation decile of the casualty''s home area.';
+
+COMMENT ON TABLE  fact_vehicles IS 'Fact table at vehicle grain: one row per vehicle involved in a collision.';
+COMMENT ON COLUMN fact_vehicles.vehicle_key IS 'Surrogate key.';
+COMMENT ON COLUMN fact_vehicles.accident_index IS 'Foreign key to fact_accidents.accident_index.';
+COMMENT ON COLUMN fact_vehicles.vehicle_reference IS 'Vehicle number within the collision.';
+COMMENT ON COLUMN fact_vehicles.vehicle_type IS 'Decoded vehicle type (Car, Van, Bus or coach, Motorcycle by engine size, ...).';
+COMMENT ON COLUMN fact_vehicles.towing_and_articulation IS 'Decoded towing or articulation configuration.';
+COMMENT ON COLUMN fact_vehicles.vehicle_manoeuvre IS 'Decoded manoeuvre the vehicle was performing at impact.';
+COMMENT ON COLUMN fact_vehicles.junction_location IS 'Decoded position of the vehicle relative to the junction.';
+COMMENT ON COLUMN fact_vehicles.skidding_and_overturning IS 'Decoded skidding, jack-knifing or overturning.';
+COMMENT ON COLUMN fact_vehicles.first_point_of_impact IS 'Decoded first point of impact on the vehicle.';
+COMMENT ON COLUMN fact_vehicles.sex_of_driver IS 'Decoded sex of the driver.';
+COMMENT ON COLUMN fact_vehicles.age_of_driver IS 'Driver age in years; -1 where STATS19 recorded it as missing.';
+COMMENT ON COLUMN fact_vehicles.age_band_of_driver IS 'Decoded driver age band.';
+COMMENT ON COLUMN fact_vehicles.engine_capacity_cc IS 'Engine capacity in cubic centimetres.';
+COMMENT ON COLUMN fact_vehicles.propulsion_code IS 'Decoded propulsion type (Petrol, Heavy oil, Electric, Hybrid, ...).';
+COMMENT ON COLUMN fact_vehicles.age_of_vehicle IS 'Vehicle age in years at the time of the collision.';
+COMMENT ON COLUMN fact_vehicles.journey_purpose IS 'Decoded journey purpose of the driver.';
+
+COMMENT ON TABLE  etl_audit_log IS 'One row per source and stage of every pipeline run. Mirrored to etl/data/audit/audit_log.jsonl so the trail survives a database rebuild.';
+COMMENT ON COLUMN etl_audit_log.audit_id IS 'Surrogate key.';
+COMMENT ON COLUMN etl_audit_log.run_id IS 'Identifier shared by every row belonging to one pipeline run.';
+COMMENT ON COLUMN etl_audit_log.source IS 'What was processed: collisions, casualties, vehicles, weather, road_context or load.';
+COMMENT ON COLUMN etl_audit_log.stage IS 'Pipeline stage: extract, transform or load.';
+COMMENT ON COLUMN etl_audit_log.row_count IS 'Rows accepted by the stage.';
+COMMENT ON COLUMN etl_audit_log.rejected_count IS 'Rows rejected by the stage; the per-reason breakdown is in message.';
+COMMENT ON COLUMN etl_audit_log.status IS 'success, partial (for example a quota-limited enrichment) or failed.';
+COMMENT ON COLUMN etl_audit_log.message IS 'Human-readable detail, including the per-reason rejection breakdown.';
+COMMENT ON COLUMN etl_audit_log.started_at IS 'When the stage started.';
+COMMENT ON COLUMN etl_audit_log.finished_at IS 'When the stage finished.';

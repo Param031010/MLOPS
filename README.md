@@ -38,8 +38,14 @@ TomTom geocoding          ─┘   (+ audit log)  (immutable)  (clean/decode/joi
                                                                          served from the same FastAPI app
 ```
 
-PostgreSQL, the FastAPI backend, and the Streamlit dashboard all run natively
-as local processes — each in its own virtualenv, no containers involved.
+PostgreSQL, the ETL scripts, and the Streamlit dashboard all run natively as
+local processes, each in its own virtualenv. The FastAPI backend can run the
+same way, or be built into a single-purpose Docker image
+(`backend/Dockerfile`) that containerizes only the inference/analytics API —
+Postgres and Streamlit are never containerized. An Airflow DAG
+(`airflow/dags/traffic_accident_etl_dag.py`) offers a third way to trigger
+the same `extract → transform → load` scripts, alongside a manual CLI run
+and `POST /admin/run-etl` — see Section 10 for how to run either.
 
 ## 4. Tech stack
 
@@ -134,6 +140,7 @@ honestly (`/accidents/overview`, dashboard home page), not hidden.
 | `GET /model/health` | Whether a model is currently loaded |
 | `GET /monitoring/drift` | Feature/label drift vs training baseline |
 | `GET /monitoring/performance` | Rolling recall/macro-F1/false-negative rate |
+| `GET /monitoring/latency` | Serving latency (p50/p95) and failure rate |
 
 Data endpoints return `503` with a readable message until `DATABASE_URL` is
 configured and reachable; `/predict` and `/model/*` return `503` until a
@@ -216,6 +223,90 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
 .venv/Scripts/mlflow ui --port 5000
 ```
 
+### Docker (containerized inference API, optional)
+
+`backend/Dockerfile` builds *only* the FastAPI inference/analytics service —
+Postgres and Streamlit stay native. Build from the repo root (it needs to
+copy `ml/` and `etl/stats19_lookups.py` alongside `backend/app`):
+
+```bash
+docker build -f backend/Dockerfile -t traffic-severity-api .
+```
+
+The image doesn't bake in the MLflow model store (`ml/mlruns/` is in
+`.dockerignore` on purpose, so the image stays small and always serves
+whatever is currently registered `Production`). Run it with `DATABASE_URL`
+pointed at the host's Postgres via `host.docker.internal` (Docker Desktop's
+bridge to the host), and `ml/mlruns` mounted in:
+
+```bash
+docker run --rm -p 9000:9000 \
+  --env-file .env \
+  -e DATABASE_URL=postgresql://user:pass@host.docker.internal:5432/traffic_accidents \
+  -e MLFLOW_TRACKING_URI="file:///C:/Users/PARAM/OneDrive/Desktop/MLOPS1/ml/mlruns" \
+  --mount type=bind,source="%cd%/ml/mlruns",target=/C:/Users/PARAM/OneDrive/Desktop/MLOPS1/ml/mlruns \
+  traffic-severity-api
+# http://127.0.0.1:9000/health, /model/info, /docs
+```
+
+The mount target and `MLFLOW_TRACKING_URI` above look unusual — they
+deliberately repeat this machine's own absolute path. That's not
+cosmetic: MLflow's local file store records each run's artifact location
+as an **absolute path** in its `meta.yaml` (e.g.
+`/C:/Users/PARAM/OneDrive/Desktop/MLOPS1/ml/mlruns/<exp>/<run>/artifacts/model`)
+at training time, not a relative one — so mounting the same directory at a
+different container path (e.g. `/srv/ml/mlruns`) lets MLflow find the run,
+but then fails to load its model artifact, because the path baked into
+that run's metadata doesn't exist inside the container. Mounting at the
+identical absolute path sidesteps that entirely. This was hit and fixed
+while producing the container run-test evidence below — adjust the path to
+match wherever you clone this repo.
+
+Verified working (2026-09-08): built `traffic-severity-api:latest`, ran it
+against the host Postgres with `ml/mlruns` mounted as above, and confirmed
+`/health`, `/model/info` (`RandomForest`, Production v2, macro-F1 0.378),
+`/model/health`, a real `/predict` call, and `/accidents/overview` (mart
+read through the host DB) all returned correctly from inside the
+container.
+
+### Airflow (optional orchestration)
+
+`airflow/dags/traffic_accident_etl_dag.py` schedules the same
+`extract.py → transform.py → load.py → quality_check.py` scripts — it
+doesn't reimplement the pipeline. Airflow has no native Windows support, so
+it needs WSL2 or a container; see `airflow/README.md` for the full setup and
+the `traffic_etl_python` / `traffic_project_root` / `traffic_road_limit`
+Variables it reads.
+
+Actually run (2026-09-08) inside a fresh WSL2 Ubuntu distro: installed
+`apache-airflow` (resolved to **3.3.1** — this Ubuntu image ships only
+Python 3.14, and Airflow installed and ran on it cleanly despite that being
+a very new interpreter). Symlinked the DAG into `$AIRFLOW_HOME/dags`, set
+the three Variables (`traffic_etl_python` pointed at the existing
+`etl/.venv/Scripts/python.exe`, invoked through WSL2's Windows-binary
+interop rather than reinstalling ETL dependencies inside Linux), started
+`airflow standalone`, confirmed `/api/v2/monitor/health` reported the
+metastore/scheduler/triggerer/dag-processor all `healthy`, unpaused the DAG,
+and triggered a real run — `extract` executed against the live Open-Meteo
+API, not a stub.
+
+Two environment gotchas worth keeping if you redo this:
+- **`PATH` must be set explicitly.** A non-login `wsl -e bash -c "..."`
+  invocation doesn't reliably inherit a usable `PATH` in every calling
+  context — `airflow standalone`'s own subprocess spawns (`airflow ...`,
+  `bash -c ...`) failed with `FileNotFoundError` until `PATH` was set to an
+  explicit, complete value covering both `/root/airflow-venv/bin` and the
+  standard `/usr/bin` etc. directories, rather than prepending to `$PATH`
+  and trusting it was already populated.
+- **From Git Bash specifically**, MSYS's automatic path conversion mangles
+  bare Linux paths like `/root/airflow` into a Windows path before `wsl.exe`
+  ever sees them — prefix such commands with `MSYS_NO_PATHCONV=1`.
+
+Airflow 3.x also moved `BashOperator` into
+`apache-airflow-providers-standard`; the DAG's `from airflow.operators.bash
+import BashOperator` still works via a deprecation-warning back-compat
+shim, so no DAG code changes were needed.
+
 ## 11. Known data-quality notes and limits
 
 - TomTom's free tier can't cover every accident coordinate; coverage is
@@ -232,11 +323,11 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
 | Required item | Comes from |
 |---|---|
 | Source code and ETL scripts | `etl/`, `backend/`, `ml/` |
-| Orchestration workflow | `extract.py → transform.py → load.py`, also triggerable via `/admin/run-etl` |
+| Orchestration workflow | `extract.py → transform.py → load.py`, triggerable via `/admin/run-etl` or the Airflow DAG (`airflow/`) |
 | Database schema and sample tables | `sql/schema.sql` + a populated-table screenshot |
 | Dataset source info | Section 2 |
-| Architecture diagram | Section 3, exported as an image for the report |
-| Data dictionary and validation rules | Column list per table (Section 5) + rejection rules (Section 6) |
+| Architecture diagram | Section 3, exported as `docs/architecture-diagram.svg` for the report |
+| Data dictionary and validation rules | `docs/DATA_DICTIONARY.md` (generated from `sql/schema.sql`) + rejection rules (Section 6) |
 | Dashboard (5+ views) | Section 8 — 8 pages |
 | Report (8–10 pages) | Written separately, referencing all sections above |
 | Screenshots / execution evidence | `load.py`'s final row-count output, a working `/predict` call, a dashboard page |
@@ -247,11 +338,15 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
 ```
 .
 ├── dataset/raw/                # STATS19 CSVs
-├── etl/                        # extract.py, transform.py, load.py, stats19_lookups.py
+├── etl/                        # extract.py, transform.py, load.py, quality_check.py, stats19_lookups.py
 ├── backend/app/                # FastAPI app, routers, db.py, models.py
+├── backend/Dockerfile          # containerizes only the inference API
 ├── dashboard/                  # Home.py + 8-page multi-page app
 ├── ml/                         # features.py, train.py, evaluate.py, RETRAINING.md
 ├── sql/schema.sql
+├── airflow/dags/                # optional Airflow DAG wrapping the ETL scripts
+├── docs/                        # DATA_DICTIONARY.md, architecture-diagram.svg
+├── .dockerignore
 ├── .env.example
 ├── CLAUDE.md                   # full build spec
 └── README.md                   # this file

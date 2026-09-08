@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 900" font-family="'Segoe UI', Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <style>
+      .box { fill:#ffffff; stroke:#444; stroke-width:1.5; rx:8; }
+      .src { fill:#eaf2fb; stroke:#3b6ea5; }
+      .etl { fill:#eafaf0; stroke:#2f9e58; }
+      .db  { fill:#fdf3e3; stroke:#c68a1f; }
+      .app { fill:#f3ecfb; stroke:#7a4fc4; }
+      .ml  { fill:#fdeaea; stroke:#c0392b; }
+      .grp { fill:none; stroke:#999; stroke-width:1; stroke-dasharray:4 3; }
+      .lbl { font-size:14px; fill:#1a1a1a; }
+      .sub { font-size:11px; fill:#555; }
+      .cap { font-size:13px; fill:#333; font-weight:600; }
+      .edge{ stroke:#444; stroke-width:1.5; fill:none; marker-end:url(#arrow); }
+      .edge-alt{ stroke:#7a4fc4; stroke-width:1.5; fill:none; marker-end:url(#arrow); stroke-dasharray:5 3; }
+    </style>
+  </defs>
+
+  <rect width="1320" height="900" fill="#ffffff"/>
+  <text x="660" y="32" text-anchor="middle" font-size="20" font-weight="700" fill="#111">Traffic Accident Severity Analytics &amp; Prediction — Architecture</text>
+
+  <!-- Sources -->
+  <rect class="box src" x="30"  y="70" width="230" height="60"/>
+  <text class="cap" x="145" y="94" text-anchor="middle">UK STATS19 CSVs</text>
+  <text class="sub" x="145" y="112" text-anchor="middle">dataset/raw/ (collisions, casualties, vehicles)</text>
+
+  <rect class="box src" x="290" y="70" width="230" height="60"/>
+  <text class="cap" x="405" y="94" text-anchor="middle">Open-Meteo API</text>
+  <text class="sub" x="405" y="112" text-anchor="middle">historical weather, free / no key</text>
+
+  <rect class="box src" x="550" y="70" width="230" height="60"/>
+  <text class="cap" x="665" y="94" text-anchor="middle">TomTom Reverse Geocoding</text>
+  <text class="sub" x="665" y="112" text-anchor="middle">road/street context, free-tier key</text>
+
+  <!-- Trigger paths -->
+  <rect class="box app" x="850" y="70" width="220" height="60" opacity="0.85"/>
+  <text class="cap" x="960" y="94" text-anchor="middle">3 trigger paths</text>
+  <text class="sub" x="960" y="111" text-anchor="middle">CLI · POST /admin/run-etl · Airflow DAG</text>
+
+  <!-- extract.py -->
+  <rect class="box etl" x="380" y="180" width="260" height="60"/>
+  <text class="cap" x="510" y="204" text-anchor="middle">extract.py</text>
+  <text class="sub" x="510" y="222" text-anchor="middle">immutable snapshot + audit log</text>
+
+  <path class="edge" d="M145,130 L145,155 L500,155 L500,180"/>
+  <path class="edge" d="M405,130 L405,155 L505,155"/>
+  <path class="edge" d="M665,130 L665,155 L520,155"/>
+  <path class="edge" d="M960,130 L960,150 L960,300"/>
+
+  <!-- raw zone -->
+  <rect class="box" x="380" y="270" width="260" height="50"/>
+  <text class="cap" x="510" y="300" text-anchor="middle">raw zone (etl/data/raw/)</text>
+  <path class="edge" d="M510,240 L510,270"/>
+
+  <!-- transform.py -->
+  <rect class="box etl" x="380" y="350" width="260" height="60"/>
+  <text class="cap" x="510" y="374" text-anchor="middle">transform.py</text>
+  <text class="sub" x="510" y="392" text-anchor="middle">clean · decode STATS19 codes · join</text>
+  <path class="edge" d="M510,320 L510,350"/>
+
+  <!-- staging -->
+  <rect class="box" x="380" y="440" width="260" height="50"/>
+  <text class="cap" x="510" y="470" text-anchor="middle">staging (parquet)</text>
+  <path class="edge" d="M510,410 L510,440"/>
+
+  <!-- load.py -->
+  <rect class="box etl" x="380" y="520" width="260" height="60"/>
+  <text class="cap" x="510" y="544" text-anchor="middle">load.py</text>
+  <text class="sub" x="510" y="562" text-anchor="middle">1 transaction: dims → facts → refresh marts</text>
+  <path class="edge" d="M510,490 L510,520"/>
+  <path class="edge" d="M960,300 L960,550 L640,550"/>
+
+  <!-- Postgres warehouse -->
+  <rect class="box db" x="330" y="620" width="360" height="90"/>
+  <text class="cap" x="510" y="644" text-anchor="middle">PostgreSQL + PostGIS — star schema</text>
+  <text class="sub" x="510" y="662" text-anchor="middle">5 dims · 3 facts · etl_audit_log</text>
+  <text class="sub" x="510" y="678" text-anchor="middle">10 mart_* materialized views</text>
+  <path class="edge" d="M510,580 L510,620"/>
+
+  <!-- FastAPI -->
+  <rect class="box app" x="150" y="750" width="260" height="70"/>
+  <text class="cap" x="280" y="778" text-anchor="middle">FastAPI backend</text>
+  <text class="sub" x="280" y="796" text-anchor="middle">mart reads · /predict · /monitoring/*</text>
+  <path class="edge" d="M420,665 L280,665 L280,750"/>
+
+  <!-- Docker box around FastAPI -->
+  <rect class="grp" x="135" y="735" width="290" height="100"/>
+  <text class="sub" x="280" y="850" text-anchor="middle" fill="#7a4fc4">optional: backend/Dockerfile (inference API only)</text>
+
+  <!-- Streamlit -->
+  <rect class="box app" x="30" y="620" width="260" height="70"/>
+  <text class="cap" x="160" y="648" text-anchor="middle">Streamlit dashboard</text>
+  <text class="sub" x="160" y="666" text-anchor="middle">8 pages, live API queries</text>
+  <path class="edge" d="M280,750 L160,750 L160,690"/>
+
+  <!-- ml/train.py -->
+  <rect class="box ml" x="760" y="620" width="260" height="70"/>
+  <text class="cap" x="890" y="648" text-anchor="middle">ml/train.py</text>
+  <text class="sub" x="890" y="666" text-anchor="middle">RF · XGBoost · LightGBM, chronological split</text>
+  <path class="edge" d="M690,650 L760,650"/>
+
+  <!-- MLflow -->
+  <rect class="box ml" x="760" y="750" width="260" height="70"/>
+  <text class="cap" x="890" y="778" text-anchor="middle">MLflow registry</text>
+  <text class="sub" x="890" y="796" text-anchor="middle">best macro-F1 run staged Production</text>
+  <path class="edge" d="M890,690 L890,750"/>
+  <path class="edge-alt" d="M760,785 L410,785"/>
+  <text class="sub" x="590" y="780" text-anchor="middle" fill="#7a4fc4">served at startup</text>
+
+  <!-- Legend -->
+  <rect class="box src" x="1080" y="70" width="16" height="16"/>
+  <text class="sub" x="1102" y="83">data source</text>
+  <rect class="box etl" x="1080" y="95" width="16" height="16"/>
+  <text class="sub" x="1102" y="108">ETL stage</text>
+  <rect class="box db" x="1080" y="120" width="16" height="16"/>
+  <text class="sub" x="1102" y="133">warehouse</text>
+  <rect class="box app" x="1080" y="145" width="16" height="16"/>
+  <text class="sub" x="1102" y="158">serving layer</text>
+  <rect class="box ml" x="1080" y="170" width="16" height="16"/>
+  <text class="sub" x="1102" y="183">MLOps (Part 2)</text>
+</svg>
