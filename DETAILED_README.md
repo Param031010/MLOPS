@@ -1,7 +1,7 @@
 # Detailed Technical Reference
 
 Companion to [README.md](README.md) (setup/run instructions) and
-[CLAUDE.md](CLAUDE.md) (build spec). This document is a function- and
+the project build spec. This document is a function- and
 column-level reference: what every module actually does, every endpoint's
 exact request/response shape, and every warehouse column's meaning —
 written from the code as it stands, so it can be read instead of opening

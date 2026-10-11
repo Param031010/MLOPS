@@ -1,7 +1,7 @@
 # Report Outline — Traffic Accident Severity Analytics & Prediction
 
 Scaffold only: section structure + facts pulled straight from the repo,
-mapped to CLAUDE.md §12's submission checklist. Every `[WRITE: ...]` marker
+mapped to the build spec §12's submission checklist. Every `[WRITE: ...]` marker
 is something only you can supply — narrative, judgment, or a screenshot.
 Target length 8–10 pages; delete this instruction line before submitting.
 
@@ -63,7 +63,7 @@ Star schema (`sql/schema.sql`), documented column-by-column in
 - **10 `mart_*` materialized views**, one per dashboard page/analytics
   endpoint, refreshed at the end of every `load.py` run.
 - [WRITE: a `psql \d` or pgAdmin screenshot of a populated table, per
-  CLAUDE.md §12.]
+  the build spec §12.]
 
 ## 5. ETL Pipeline & Validation Rules
 
@@ -142,7 +142,7 @@ Star schema (`sql/schema.sql`), documented column-by-column in
 - [WRITE: 2-3 dashboard screenshots — Home KPI strip, Hotspot Map, and
   Severity Predictor are the most visually convincing choices.]
 - [WRITE: a terminal/Swagger screenshot of a real `POST /predict` call and
-  response, per CLAUDE.md §12's execution-evidence requirement.]
+  response, per the build spec §12's execution-evidence requirement.]
 
 ## 8. Part 2 — MLOps
 
@@ -201,7 +201,7 @@ Star schema (`sql/schema.sql`), documented column-by-column in
   `/accidents/overview` all verified working from inside the container
   (see README.md's Docker section for the exact command and the
   absolute-path mount gotcha that had to be worked around).
-- [WRITE: `docker images` / `docker ps` screenshot, per CLAUDE.md §12.]
+- [WRITE: `docker images` / `docker ps` screenshot, per the build spec §12.]
 
 ## 9. Results & Discussion
 
@@ -228,7 +228,7 @@ Star schema (`sql/schema.sql`), documented column-by-column in
 
 ## Appendix — Screenshots / Execution Evidence Checklist
 
-Per CLAUDE.md §12, collect these before assembling the final document:
+Per the build spec §12, collect these before assembling the final document:
 
 - [ ] `load.py`'s final row-count console output
 - [ ] `psql \d` (or pgAdmin) of a populated table

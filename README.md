@@ -405,7 +405,6 @@ shim, so no DAG code changes were needed.
 ├── docs/                       # DATA_DICTIONARY.md, REPORT_OUTLINE.md, architecture-diagram.svg, generate_data_dictionary.py
 ├── .dockerignore
 ├── .env.example
-├── CLAUDE.md                   # full build spec
 ├── DETAILED_README.md          # function- and column-level technical reference
 └── README.md                   # this file
 ```
