@@ -12,6 +12,7 @@ as soon as any of the following is true.
 | False-negative rate on Fatal/Serious | Exceeds 15% (a Fatal or Serious accident predicted as Slight is the costliest error this model can make) | `GET /monitoring/performance` |
 | Feature drift | Population Stability Index (PSI) exceeds **0.2** on any single feature in `GET /monitoring/drift` | `dim_weather`, `dim_road`, `dim_date` via recent `fact_accidents` |
 | New data volume | A `load.py` run adds a full new year of accidents to `fact_accidents` | `etl_audit_log` |
+| Input data quality | `GET /monitoring/data-quality` flags a field: missing-rate up more than 10 points on its training baseline, or more than 5% implausible / unseen values | `vw_model_features` via recent `fact_accidents` |
 | Upstream schema/code change | STATS19 changes its lookup codes, or `ml/features.py`'s `CATEGORICAL_VOCAB` / `FEATURE_COLUMNS` changes | code review |
 
 PSI interpretation used here (standard bands): `< 0.1` no meaningful shift,
@@ -43,3 +44,15 @@ Retraining is not triggered automatically by the monitoring endpoints --
 a human to act on. Automatic retraining on live production-severity
 accident data is out of scope for this project (STATS19 records arrive in
 DfT's own release cycle, not in real time).
+
+## Model lifecycle
+
+| Stage | What happens | Where it is recorded |
+|---|---|---|
+| Data | ETL loads STATS19 + weather + road context; `vw_model_features` exposes the model-ready table | `etl_audit_log`, `rejected_records.csv` |
+| Train | RandomForest, XGBoost, LightGBM fit on a chronological 70/15/15 split with class weighting; each run logs params, val/test metrics, per-class recall, Fatal/Serious false-negative rate and confusion matrices | MLflow experiment `traffic-accident-severity` |
+| Package | The winner (by validation macro-F1) is wrapped with its feature engineering as one `SeverityPipeline` and registered; `baseline.json` (feature/location deciles, class mix, missing rates) is stored beside it | MLflow registry `traffic_severity_classifier` |
+| Promote | New version moves to `Production`; the previous Production version is `Archived` | MLflow registry |
+| Serve | FastAPI loads the Production model at startup (`/predict`, `/model/info`); the Docker image serves the same artifact | `backend/`, `backend/Dockerfile` |
+| Monitor | Drift (feature, location, class), rolling performance, FNR, input-data quality, latency and failures | `/monitoring/*`, dashboard page 8 |
+| Retrain / roll back | Any trigger above -> procedure above; a regressing version is archived and the previous one re-promoted | MLflow registry history |

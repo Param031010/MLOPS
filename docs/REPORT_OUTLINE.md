@@ -83,14 +83,28 @@ Star schema (`sql/schema.sql`), documented column-by-column in
   task): fails if any table/mart is empty, any fact row fails to resolve a
   dimension, or the last audit-log row isn't `success`.
 - Known, honestly-surfaced coverage gaps (free-tier quotas, not a bug):
-  weather coverage started at **35.0%** and rose to **57.7%** after the
-  Airflow-triggered `extract` run on 2026-09-08 pulled the previously
-  unfetched Open-Meteo grid-year cells — direct evidence the pipeline is
-  genuinely resumable/rerunnable, not a one-shot script. Road-context
-  (TomTom) coverage stayed at **0.29%** for that run only because
-  `traffic_road_limit` was deliberately set to `0` (TomTom's daily quota was
-  already exhausted); both are reported live via `/accidents/overview` and
-  the dashboard home page rather than hidden.
+  weather coverage started at **35.0%** and reached **100%** (513,748 of
+  513,748 accidents) after repeated resumable `extract` runs pulled the
+  previously unfetched Open-Meteo grid-year cells — direct evidence the
+  pipeline is genuinely resumable/rerunnable, not a one-shot script.
+  Road-context (TomTom) coverage is **0.29%** (1,510 accidents) because the
+  free-tier quota is spent busiest-coordinate-first; both are reported live
+  via `/accidents/overview` and the dashboard home page rather than hidden.
+- **Rejected-record log**: `transform.py` writes
+  `etl/data/audit/rejected_records.csv` — one row per dropped collision with
+  its reason (latest run: 53 rejected, all `missing_coordinates`) — alongside
+  the per-reason counts in `audit_log.jsonl` / `etl_audit_log`.
+- **Model-ready table**: view `vw_model_features` (one row per collision,
+  features + label), which `ml/train.py` reads.
+- **A real data-quality finding** (worth a paragraph in the report): the
+  input-data-quality monitor flagged `junction_detail` — 45% of collisions
+  decoded as "Unknown code N". Root cause: the DfT export carries both a
+  historic junction column (codes 0–9) and a renumbered new-scheme column
+  (13, 16, 17, 18, 19). Cross-tabulating them in the raw data proved the
+  mapping (13↔3, 16↔6, 17↔7, 18↔8, 19↔9), so `stats19_lookups.py` now merges
+  both onto one vocabulary and `9`/`99` decode as "Unknown (self reported)".
+  The warehouse was reloaded and the model retrained; the monitor now flags
+  nothing.
 - [WRITE: `load.py`'s final row-count console output as a screenshot —
   this is the assignment's "successful end-to-end pipeline execution"
   evidence.]
@@ -141,11 +155,22 @@ Star schema (`sql/schema.sql`), documented column-by-column in
   experiment `traffic-accident-severity`; the macro-F1 winner registered as
   `traffic_severity_classifier` and staged `Production`, archiving the
   prior version on promotion.
-- **Current Production model** (v2, verified 2026-09-08): **RandomForest**,
-  accuracy **0.592**, macro-F1 **0.378**, recall (macro) **0.430** — not
-  degenerate; it predicts all three severity classes and trades precision
-  for recall on the rare severities (Fatal/Serious), which is the safer
-  failure mode for this problem.
+- **Packaging**: preprocessing and model are one registered artifact
+  (`ml/pipeline.py`, `SeverityPipeline`): raw record in -> feature
+  engineering -> model -> class probabilities, with the feature code bundled
+  in the MLflow model (`code_paths`) so it loads in the Docker image without
+  the repo on the path. Missing weather is `NaN` at both training and
+  serving time.
+- **Current Production model** (v4, 2026-10-11): **RandomForest** won on
+  validation macro-F1 (RandomForest 0.371, LightGBM 0.349, XGBoost 0.348).
+  Test split: accuracy **0.55**, macro-F1 **0.364**, recall (macro)
+  **0.461**; recall by class Fatal **0.43**, Serious **0.32**, Slight
+  **0.64**; false-negative rate on Fatal/Serious **0.48**. It predicts all
+  three classes and trades precision for recall on the rare severities, but
+  roughly half of Fatal/Serious accidents are still predicted as Slight —
+  a limit of the available features (no driver, speed or vehicle-condition
+  information is known beforehand), and it exceeds the 15% retraining
+  trigger, which the monitoring page shows deliberately.
 - **Evaluation**: `evaluate.py` — recall, macro-F1, confusion matrix logged
   as MLflow artifacts. [WRITE: embed `ml/artifacts/confusion_matrix.png`
   and a sentence interpreting it — which severities get confused with
@@ -156,9 +181,12 @@ Star schema (`sql/schema.sql`), documented column-by-column in
 - **Monitoring**: `/monitoring/drift` (PSI across feature/location/class
   vs. a training baseline), `/monitoring/performance` (rolling macro-F1/
   recall/false-negative rate on the most recent accidents),
-  `/monitoring/latency` (serving p50/p95 + failure rate) — all real
-  computed metrics, not placeholders. `8_Model_Monitoring.py` visualizes
-  all three with the thresholds below drawn in.
+  `/monitoring/data-quality` (missing / out-of-range / unseen-category
+  rates, warehouse window + live requests), `/monitoring/latency` (serving
+  p50/p95 + failure rate) — all real computed metrics, not placeholders.
+  Drift is measured on the most recent ~1 year (100k accidents) so
+  seasonal weather doesn't read as drift. `8_Model_Monitoring.py`
+  visualizes all of them with the thresholds below drawn in.
 - **Retraining policy** (`ml/RETRAINING.md`): retrain if rolling macro-F1
   drops **>5 points**, false-negative rate on Fatal/Serious exceeds
   **15%**, PSI exceeds **0.2** on any feature, a full new year of data
@@ -177,11 +205,11 @@ Star schema (`sql/schema.sql`), documented column-by-column in
 
 ## 9. Results & Discussion
 
-- [WRITE: interpret the model's metrics in plain language — is 0.378
+- [WRITE: interpret the model's metrics in plain language — is 0.364
   macro-F1 "good" for this problem? Compare to a naive baseline (e.g.
   always predicting the majority class "Slight") if you want a concrete
   anchor.]
-- [WRITE: what the enrichment-coverage gaps (35% weather, 0.29% road
+- [WRITE: what the enrichment-coverage gaps (weather now complete, 0.29% road
   context) mean for the model and dashboard — does the model even use
   `street_name`? If not, road-context coverage matters more for the
   dashboard than for prediction quality; say so.]

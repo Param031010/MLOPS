@@ -280,6 +280,7 @@ GROUP BY s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_by_hour_weekday AS
 SELECT
+    d.year,
     d.hour,
     d.day_of_week,
     d.day_name,
@@ -289,7 +290,7 @@ SELECT
 FROM fact_accidents fa
 JOIN dim_date d ON d.date_key = fa.date_key
 JOIN dim_severity s ON s.severity_id = fa.severity_id
-GROUP BY d.hour, d.day_of_week, d.day_name, s.severity_id, s.severity_label;
+GROUP BY d.year, d.hour, d.day_of_week, d.day_name, s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_monthly_trend AS
 SELECT
@@ -308,27 +309,35 @@ GROUP BY d.year, d.month, d.month_name, s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_weather_impact AS
 SELECT
+    d.year,
     w.weather_conditions,
     s.severity_id,
     s.severity_label,
     COUNT(*) AS accident_count,
-    AVG(w.temperature_c) AS avg_temperature_c,
-    AVG(w.precipitation_mm) AS avg_precipitation_mm
+    -- sums + non-null counts (not AVG) so the API can re-average correctly
+    -- over any year range: an average of averages would be wrong.
+    SUM(w.temperature_c) AS sum_temperature_c,
+    COUNT(w.temperature_c) AS n_temperature,
+    SUM(w.precipitation_mm) AS sum_precipitation_mm,
+    COUNT(w.precipitation_mm) AS n_precipitation
 FROM fact_accidents fa
+JOIN dim_date d ON d.date_key = fa.date_key
 JOIN dim_weather w ON w.weather_id = fa.weather_id
 JOIN dim_severity s ON s.severity_id = fa.severity_id
-GROUP BY w.weather_conditions, s.severity_id, s.severity_label;
+GROUP BY d.year, w.weather_conditions, s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_road_type_severity AS
 SELECT
+    d.year,
     r.road_type,
     s.severity_id,
     s.severity_label,
     COUNT(*) AS accident_count
 FROM fact_accidents fa
+JOIN dim_date d ON d.date_key = fa.date_key
 JOIN dim_road r ON r.road_id = fa.road_id
 JOIN dim_severity s ON s.severity_id = fa.severity_id
-GROUP BY r.road_type, s.severity_id, s.severity_label;
+GROUP BY d.year, r.road_type, s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_hotspots AS
 SELECT
@@ -365,36 +374,44 @@ ORDER BY accident_count DESC;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_casualties_by_type AS
 SELECT
+    d.year,
     fc.casualty_type,
     fc.casualty_class,
     s.severity_id,
     s.severity_label,
     COUNT(*) AS casualty_count
 FROM fact_casualties fc
+JOIN fact_accidents fa ON fa.accident_index = fc.accident_index
+JOIN dim_date d ON d.date_key = fa.date_key
 JOIN dim_severity s ON s.severity_id = fc.casualty_severity_id
-GROUP BY fc.casualty_type, fc.casualty_class, s.severity_id, s.severity_label;
+GROUP BY d.year, fc.casualty_type, fc.casualty_class, s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_casualty_demographics AS
 SELECT
+    d.year,
     fc.age_band_of_casualty,
     fc.sex_of_casualty,
     s.severity_id,
     s.severity_label,
     COUNT(*) AS casualty_count
 FROM fact_casualties fc
+JOIN fact_accidents fa ON fa.accident_index = fc.accident_index
+JOIN dim_date d ON d.date_key = fa.date_key
 JOIN dim_severity s ON s.severity_id = fc.casualty_severity_id
-GROUP BY fc.age_band_of_casualty, fc.sex_of_casualty, s.severity_id, s.severity_label;
+GROUP BY d.year, fc.age_band_of_casualty, fc.sex_of_casualty, s.severity_id, s.severity_label;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mart_vehicles_by_type AS
 SELECT
+    d.year,
     fv.vehicle_type,
     s.severity_id,
     s.severity_label,
     COUNT(*) AS vehicle_count
 FROM fact_vehicles fv
 JOIN fact_accidents fa ON fa.accident_index = fv.accident_index
+JOIN dim_date d ON d.date_key = fa.date_key
 JOIN dim_severity s ON s.severity_id = fa.severity_id
-GROUP BY fv.vehicle_type, s.severity_id, s.severity_label;
+GROUP BY d.year, fv.vehicle_type, s.severity_id, s.severity_label;
 
 -- Convenience function: refresh every mart in one call (used by etl/load.py
 -- and available for a manual `SELECT refresh_marts();`)
@@ -420,6 +437,24 @@ $$ LANGUAGE plpgsql;
 -- shows them and docs/generate_data_dictionary.py can emit the submitted data
 -- dictionary straight from the live schema, instead of a hand-maintained copy
 -- that silently drifts out of date.
+
+-- Model-ready table: one row per accident with every field the severity
+-- classifier consumes, resolved through the dimensions. A plain view (not a
+-- mart) so it is always current and ml/train.py reads exactly one object.
+CREATE OR REPLACE VIEW vw_model_features AS
+SELECT fa.accident_index, fa.severity_id, fa.number_of_vehicles,
+       d.full_date, d.hour, d.day_of_week, d.month, d.is_weekend,
+       r.road_type, r.speed_limit, r.junction_detail,
+       l.urban_or_rural_area, l.latitude, l.longitude,
+       w.light_conditions, w.weather_conditions, w.road_surface_conditions,
+       w.temperature_c, w.precipitation_mm
+FROM fact_accidents fa
+JOIN dim_date d ON d.date_key = fa.date_key
+JOIN dim_road r ON r.road_id = fa.road_id
+JOIN dim_weather w ON w.weather_id = fa.weather_id
+JOIN dim_location l ON l.location_id = fa.location_id;
+
+COMMENT ON VIEW vw_model_features IS 'Model-ready table: one row per collision with the features and label used by ml/train.py.';
 
 COMMENT ON TABLE  dim_severity IS 'Severity lookup, seeded from STATS19 codes. -1 is STATS19''s own "data missing or out of range" value, kept as a labelled category rather than dropped.';
 COMMENT ON COLUMN dim_severity.severity_id IS 'STATS19 severity code: 1=Fatal, 2=Serious, 3=Slight, -1=Data missing.';

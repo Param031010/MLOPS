@@ -4,7 +4,7 @@ Every table and column of the traffic-accident warehouse, generated from
 the live PostgreSQL schema by `docs/generate_data_dictionary.py`.
 Descriptions are the `COMMENT ON` values defined in `sql/schema.sql`.
 
-Generated 2026-09-07 19:53 UTC.
+Generated 2026-10-11 17:06 UTC.
 
 Validation rules applied before a row reaches these tables are listed in
 [Validation rules](#validation-rules) at the end.
@@ -68,7 +68,7 @@ One row per distinct collision coordinate, enriched with TomTom street context w
 
 Junk dimension over the road-configuration attributes of a collision.
 
-*38,499 rows at generation time.*
+*70,100 rows at generation time.*
 
 | Column | Type | Null | Key | Description |
 |---|---|---|---|---|
@@ -88,7 +88,7 @@ Junk dimension over the road-configuration attributes of a collision.
 
 Junk dimension combining police-observed STATS19 conditions with Open-Meteo measurements for the collision hour.
 
-*138,848 rows at generation time.*
+*362,256 rows at generation time.*
 
 | Column | Type | Null | Key | Description |
 |---|---|---|---|---|
@@ -178,7 +178,7 @@ Fact table at vehicle grain: one row per vehicle involved in a collision.
 
 One row per source and stage of every pipeline run. Mirrored to etl/data/audit/audit_log.jsonl so the trail survives a database rebuild.
 
-*4 rows at generation time.*
+*10 rows at generation time.*
 
 | Column | Type | Null | Key | Description |
 |---|---|---|---|---|
@@ -199,16 +199,16 @@ Each view backs one dashboard page and is refreshed at the end of every `load.py
 
 | View | Columns | Rows |
 |---|---|---|
-| `mart_by_hour_weekday` | None | 504 |
-| `mart_casualties_by_type` | None | 127 |
-| `mart_casualty_demographics` | None | 108 |
+| `mart_by_hour_weekday` | None | 2,514 |
+| `mart_casualties_by_type` | None | 571 |
+| `mart_casualty_demographics` | None | 494 |
 | `mart_hotspots` | None | 513,748 |
 | `mart_monthly_trend` | None | 180 |
-| `mart_road_type_severity` | None | 18 |
+| `mart_road_type_severity` | None | 89 |
 | `mart_severity_distribution` | None | 3 |
 | `mart_top_locations` | None | 512,309 |
-| `mart_vehicles_by_type` | None | 66 |
-| `mart_weather_impact` | None | 28 |
+| `mart_vehicles_by_type` | None | 320 |
+| `mart_weather_impact` | None | 132 |
 
 ## Validation rules
 

@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pandas as pd
 
+# In the repo the lookups live in ../etl; inside a logged MLflow model both
+# files are bundled side by side (see train.py's code_paths).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "etl"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stats19_lookups as lk  # noqa: E402
 
 CATEGORICAL_VOCAB: dict[str, list[str]] = {
@@ -53,13 +56,28 @@ def encode_category(field: str, value) -> int:
         return unknown_bucket
 
 
+def _to_float(val) -> float:
+    """None, NaN and unparseable values all become NaN -- the same value
+    pandas gives a NULL when train.py reads the warehouse, so a missing
+    reading looks identical at training and serving time. (The tree models
+    treat NaN natively; mapping it to 0.0 would silently turn "unknown
+    temperature" into "freezing".)"""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def build_features(record: dict) -> dict:
     """record: a raw accident-like dict, or a /predict request body dict."""
     feat: dict = {}
     for col in NUMERIC_COLUMNS:
-        val = record.get(col)
-        feat[col] = float(val) if val is not None else 0.0
-    feat["is_weekend"] = int(bool(record.get("is_weekend", False)))
+        feat[col] = _to_float(record.get(col))
+    weekend = record.get("is_weekend")
+    if weekend is None or weekend != weekend:  # None or NaN: derive it
+        # STATS19 day_of_week: 1 = Sunday ... 7 = Saturday (as in transform.py)
+        weekend = record.get("day_of_week") in (1, 7)
+    feat["is_weekend"] = int(bool(weekend))
     for field in CATEGORICAL_VOCAB:
         feat[f"{field}_code"] = encode_category(field, record.get(field))
     return feat
@@ -69,3 +87,14 @@ def build_features_df(df: pd.DataFrame) -> pd.DataFrame:
     records = df.to_dict("records")
     encoded = pd.DataFrame([build_features(r) for r in records], index=df.index)
     return encoded[FEATURE_COLUMNS]
+
+
+def input_issues(record: dict) -> dict[str, list[str]]:
+    """Data-quality problems in one raw record, for serving-time monitoring:
+    numeric fields that are missing/unparseable and categorical values the
+    model's vocabulary has never seen (they would silently fall into the
+    'unknown' bucket)."""
+    missing = [c for c in NUMERIC_COLUMNS if _to_float(record.get(c)) != _to_float(record.get(c))]
+    unknown = [f for f in CATEGORICAL_VOCAB
+               if encode_category(f, record.get(f)) == len(CATEGORICAL_VOCAB[f])]
+    return {"missing_numeric": missing, "unknown_category": unknown}

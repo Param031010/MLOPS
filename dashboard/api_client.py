@@ -34,3 +34,23 @@ def post(path: str, json: dict | None = None, headers: dict | None = None):
     except requests.RequestException as exc:
         raise ApiError(f"POST {path} failed: {exc}") from exc
     return resp
+
+
+SEVERITY_IDS = {"Fatal": 1, "Serious": 2, "Slight": 3}
+
+
+def sidebar_filters() -> dict:
+    """Shared sidebar: year range + severity. Returns the query params every
+    mart endpoint understands, so a change re-queries the API server-side
+    instead of filtering a cached full table in the browser."""
+    overview = get("/accidents/overview")
+    years = overview.get("years_covered") or []
+    st.sidebar.subheader("Filters")
+    params: dict = {}
+    if len(years) > 1:
+        lo, hi = st.sidebar.slider("Years", min(years), max(years), (min(years), max(years)))
+        params.update(year_from=lo, year_to=hi)
+    chosen = st.sidebar.multiselect("Severity", list(SEVERITY_IDS), default=list(SEVERITY_IDS))
+    if chosen and len(chosen) < len(SEVERITY_IDS):
+        params["severity"] = [SEVERITY_IDS[c] for c in chosen]
+    return params

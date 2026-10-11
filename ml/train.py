@@ -27,7 +27,9 @@ from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 sys.path.insert(0, str(Path(__file__).parent))
-from features import FEATURE_COLUMNS, NUMERIC_COLUMNS, build_features_df  # noqa: E402
+from features import NUMERIC_COLUMNS, build_features_df  # noqa: E402
+from pipeline import SeverityPipeline  # noqa: E402
+from reporting import log_split_report  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -36,31 +38,15 @@ ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 EXPERIMENT_NAME = "traffic-accident-severity"
 
 TRAIN_QUERY = """
-    SELECT fa.accident_index, fa.severity_id, fa.number_of_vehicles,
-           d.full_date, d.hour, d.day_of_week, d.month, d.is_weekend,
-           r.road_type, r.speed_limit, r.junction_detail,
-           l.urban_or_rural_area, l.latitude, l.longitude,
-           w.light_conditions, w.weather_conditions, w.road_surface_conditions,
-           w.temperature_c, w.precipitation_mm
-    FROM fact_accidents fa
-    JOIN dim_date d ON d.date_key = fa.date_key
-    JOIN dim_road r ON r.road_id = fa.road_id
-    JOIN dim_weather w ON w.weather_id = fa.weather_id
-    JOIN dim_location l ON l.location_id = fa.location_id
-    ORDER BY d.full_date
+    SELECT accident_index, severity_id, number_of_vehicles,
+           full_date, hour, day_of_week, month, is_weekend,
+           road_type, speed_limit, junction_detail,
+           urban_or_rural_area, latitude, longitude,
+           light_conditions, weather_conditions, road_surface_conditions,
+           temperature_c, precipitation_mm
+    FROM vw_model_features
+    ORDER BY full_date
 """
-
-
-class SeverityModelWrapper(mlflow.pyfunc.PythonModel):
-    """Uniform predict_proba-shaped serving contract over any of the three
-    trained model flavours."""
-
-    def __init__(self, model, classes: list[int]):
-        self.model = model
-        self.classes = list(classes)
-
-    def predict(self, context, model_input: pd.DataFrame):
-        return self.model.predict_proba(model_input[FEATURE_COLUMNS])
 
 
 def load_training_data() -> pd.DataFrame:
@@ -109,6 +95,7 @@ def numeric_feature_baseline(train_df: pd.DataFrame) -> dict:
     for col in NUMERIC_COLUMNS:
         profile = decile_profile(train_df[col])
         if profile is not None:
+            profile["missing_rate"] = float(train_df[col].isna().mean())
             stats[col] = profile
     return stats
 
@@ -126,14 +113,14 @@ def location_baseline(train_df: pd.DataFrame) -> dict:
     return stats
 
 
-def evaluate_split(model, X, y_true, classes) -> dict:
+def evaluate_split(model, X, y_true, classes) -> tuple[dict, list]:
     proba = model.predict_proba(X)
     y_pred = [classes[i] for i in np.argmax(proba, axis=1)]
     return {
         "accuracy": accuracy_score(y_true, y_pred),
         "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
         "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
-    }
+    }, y_pred
 
 
 def default_tracking_uri() -> str:
@@ -196,12 +183,18 @@ def main() -> None:
                 # RandomForest and LightGBM already balance via class_weight=.
                 model.fit(X_train, y_train)
 
-            val_metrics = evaluate_split(model, X_val, y_val, classes)
-            test_metrics = evaluate_split(model, X_test, y_test, classes)
+            val_metrics, val_pred = evaluate_split(model, X_val, y_val, classes)
+            test_metrics, test_pred = evaluate_split(model, X_test, y_test, classes)
 
             mlflow.log_params(model.get_params())
+            mlflow.log_params({"train_rows": len(train_df), "val_rows": len(val_df),
+                               "test_rows": len(test_df), "split": "chronological 70/15/15"})
             mlflow.log_metrics({f"val_{k}": v for k, v in val_metrics.items()})
             mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
+
+            # per-class recall, severe false-negative rate, confusion matrices
+            log_split_report("val", y_val, val_pred, classes, name, ARTIFACTS_DIR / name)
+            log_split_report("test", y_test, test_pred, classes, name, ARTIFACTS_DIR / name)
 
             results[name] = {
                 "model": model, "val_metrics": val_metrics, "test_metrics": test_metrics,
@@ -217,15 +210,28 @@ def main() -> None:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
     with mlflow.start_run(run_name=f"{best_name}-production-candidate"):
-        wrapper = SeverityModelWrapper(best["model"], classes)
+        # One inference artifact: raw record in -> feature engineering -> model
+        # -> probabilities. code_paths bundles the feature code and lookups so
+        # the model loads anywhere (e.g. the Docker image) without sys.path luck.
+        here = Path(__file__).parent
+        pipeline = SeverityPipeline(best["model"], classes)
+        # No MLflow signature on purpose: schema enforcement would reject the
+        # None/Decimal values a real request or warehouse row carries, and the
+        # pipeline already tolerates missing fields itself. A raw example is
+        # logged as a plain artifact for documentation instead.
+        raw_example = test_df.drop(columns=["severity_id"]).head(3).astype(str)
+        mlflow.log_dict(raw_example.to_dict("records"), "raw_input_example.json")
         model_info = mlflow.pyfunc.log_model(
             artifact_path="model",
-            python_model=wrapper,
+            python_model=pipeline,
             registered_model_name=MODEL_NAME,
-            input_example=X_test.head(3),
+            code_paths=[str(here / "features.py"), str(here / "pipeline.py"),
+                        str(here.parent / "etl" / "stats19_lookups.py")],
         )
+        prod_run_id = mlflow.active_run().info.run_id
         mlflow.log_metrics({f"test_{k}": v for k, v in best["test_metrics"].items()})
         mlflow.set_tag("algorithm", best_name)
+        mlflow.set_tag("split", "chronological 70/15/15")
 
         client = mlflow.tracking.MlflowClient()
         version = model_info.registered_model_version
@@ -245,6 +251,9 @@ def main() -> None:
         "class_distribution": pd.Series(y_train).value_counts(normalize=True).to_dict(),
     }
     (ARTIFACTS_DIR / "baseline.json").write_text(json.dumps(baseline, indent=2, default=str))
+    with mlflow.start_run(run_id=prod_run_id):
+        # keep the monitoring baseline versioned with the model it describes
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "baseline.json"))
     print(f"[train] wrote baseline to {ARTIFACTS_DIR / 'baseline.json'}")
 
 

@@ -2,29 +2,22 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from api_client import ApiError, get
+from api_client import ApiError, get, sidebar_filters
 
 st.set_page_config(page_title="Time Patterns", page_icon="\U0001F550", layout="wide")
 st.title("Time Patterns")
 
 try:
-    hour_rows = get("/accidents/by-hour")
-    monthly_rows = get("/accidents/monthly-trend")
+    params = sidebar_filters()
+    hour_df = pd.DataFrame(get("/accidents/by-hour", params=params))
+    monthly_df = pd.DataFrame(get("/accidents/monthly-trend", params=params))
 except ApiError as exc:
     st.error(str(exc))
     st.stop()
 
-hour_df = pd.DataFrame(hour_rows)
-monthly_df = pd.DataFrame(monthly_rows)
 if hour_df.empty:
-    st.info("No data yet -- run the ETL pipeline.")
+    st.info("No data for these filters -- widen them or run the ETL pipeline.")
     st.stop()
-
-severities = sorted(hour_df["severity_label"].unique())
-selected = st.sidebar.multiselect("Severity", severities, default=severities)
-
-hour_df = hour_df[hour_df["severity_label"].isin(selected)]
-monthly_df = monthly_df[monthly_df["severity_label"].isin(selected)]
 
 tab1, tab2 = st.tabs(["Hour x Weekday", "Monthly Trend"])
 

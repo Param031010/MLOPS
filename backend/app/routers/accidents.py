@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from ..db import fetch_all, fetch_one, get_connection
+from ..db import fetch_all, fetch_one, get_connection, mart_filters
 from ..schemas import (
     ByHourWeekdayRow,
     HotspotRow,
@@ -67,38 +67,62 @@ async def severity_distribution(conn: AsyncConnection = Depends(get_connection))
     """)
 
 
+SeverityQ = Query(None, description="Severity ids to include (repeatable)")
+YearFromQ = Query(None, description="First year to include")
+YearToQ = Query(None, description="Last year to include")
+
+
 @router.get("/by-hour", response_model=list[ByHourWeekdayRow])
-async def by_hour(conn: AsyncConnection = Depends(get_connection)):
-    return await fetch_all(conn, """
-        SELECT hour, day_of_week, day_name, severity_id, severity_label, accident_count
-        FROM mart_by_hour_weekday ORDER BY day_of_week, hour, severity_id
-    """)
+async def by_hour(severity: Optional[list[int]] = SeverityQ, year_from: Optional[int] = YearFromQ,
+                  year_to: Optional[int] = YearToQ, conn: AsyncConnection = Depends(get_connection)):
+    where, params = mart_filters(severity, year_from, year_to)
+    return await fetch_all(conn, f"""
+        SELECT hour, day_of_week, day_name, severity_id, severity_label,
+               SUM(accident_count)::bigint AS accident_count
+        FROM mart_by_hour_weekday {where}
+        GROUP BY hour, day_of_week, day_name, severity_id, severity_label
+        ORDER BY day_of_week, hour, severity_id
+    """, params)
 
 
 @router.get("/monthly-trend", response_model=list[MonthlyTrendRow])
-async def monthly_trend(conn: AsyncConnection = Depends(get_connection)):
-    return await fetch_all(conn, """
+async def monthly_trend(severity: Optional[list[int]] = SeverityQ, year_from: Optional[int] = YearFromQ,
+                        year_to: Optional[int] = YearToQ, conn: AsyncConnection = Depends(get_connection)):
+    where, params = mart_filters(severity, year_from, year_to)
+    return await fetch_all(conn, f"""
         SELECT year, month, month_name, severity_id, severity_label,
                accident_count, total_casualties, total_vehicles
-        FROM mart_monthly_trend ORDER BY year, month, severity_id
-    """)
+        FROM mart_monthly_trend {where} ORDER BY year, month, severity_id
+    """, params)
 
 
 @router.get("/weather-impact", response_model=list[WeatherImpactRow])
-async def weather_impact(conn: AsyncConnection = Depends(get_connection)):
-    return await fetch_all(conn, """
-        SELECT weather_conditions, severity_id, severity_label, accident_count,
-               avg_temperature_c, avg_precipitation_mm
-        FROM mart_weather_impact ORDER BY accident_count DESC
-    """)
+async def weather_impact(severity: Optional[list[int]] = SeverityQ, year_from: Optional[int] = YearFromQ,
+                         year_to: Optional[int] = YearToQ, conn: AsyncConnection = Depends(get_connection)):
+    where, params = mart_filters(severity, year_from, year_to)
+    return await fetch_all(conn, f"""
+        SELECT weather_conditions, severity_id, severity_label,
+               SUM(accident_count)::bigint AS accident_count,
+               SUM(sum_temperature_c) / NULLIF(SUM(n_temperature), 0) AS avg_temperature_c,
+               SUM(sum_precipitation_mm) / NULLIF(SUM(n_precipitation), 0) AS avg_precipitation_mm
+        FROM mart_weather_impact {where}
+        GROUP BY weather_conditions, severity_id, severity_label
+        ORDER BY accident_count DESC
+    """, params)
 
 
 @router.get("/road-type-severity", response_model=list[RoadTypeSeverityRow])
-async def road_type_severity(conn: AsyncConnection = Depends(get_connection)):
-    return await fetch_all(conn, """
-        SELECT road_type, severity_id, severity_label, accident_count
-        FROM mart_road_type_severity ORDER BY accident_count DESC
-    """)
+async def road_type_severity(severity: Optional[list[int]] = SeverityQ, year_from: Optional[int] = YearFromQ,
+                             year_to: Optional[int] = YearToQ,
+                             road_type: Optional[list[str]] = Query(None, description="Road types to include"),
+                             conn: AsyncConnection = Depends(get_connection)):
+    where, params = mart_filters(severity, year_from, year_to, road_type=road_type)
+    return await fetch_all(conn, f"""
+        SELECT road_type, severity_id, severity_label, SUM(accident_count)::bigint AS accident_count
+        FROM mart_road_type_severity {where}
+        GROUP BY road_type, severity_id, severity_label
+        ORDER BY accident_count DESC
+    """, params)
 
 
 @router.get("/hotspots", response_model=list[HotspotRow])

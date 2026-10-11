@@ -19,6 +19,8 @@ RAW_DIR = Path(__file__).parent / "data" / "raw"
 STAGING_DIR = Path(__file__).parent / "data" / "staging"
 
 GRID_STEP = 0.5
+AUDIT_DIR = Path(__file__).parent / "data" / "audit"
+REJECT_COLUMNS = ["collision_index", "collision_year", "date", "time", "latitude", "longitude"]
 GB_LAT_RANGE = (49.8, 60.9)
 GB_LON_RANGE = (-8.6, 1.8)
 
@@ -40,27 +42,45 @@ def clean_collisions(df: pd.DataFrame, run_id: str) -> pd.DataFrame:
     started = datetime.now(timezone.utc)
     n0 = len(df)
     rejections: dict[str, int] = {}
+    rejected_frames: list[pd.DataFrame] = []
+
+    def reject(bad: pd.DataFrame, reason: str) -> None:
+        if len(bad):
+            rejected_frames.append(
+                bad.reindex(columns=REJECT_COLUMNS).assign(rejection_reason=reason, run_id=run_id))
 
     before = len(df)
-    df = df.drop_duplicates(subset=["collision_index"], keep="first")
+    dup = df.duplicated(subset=["collision_index"], keep="first")
+    reject(df[dup], "duplicate_collision_index")
+    df = df[~dup]
     rejections["duplicate_collision_index"] = before - len(df)
 
     before = len(df)
-    df = df.dropna(subset=["latitude", "longitude"])
+    no_coord = df["latitude"].isna() | df["longitude"].isna()
+    reject(df[no_coord], "missing_coordinates")
+    df = df[~no_coord]
     rejections["missing_coordinates"] = before - len(df)
 
     before = len(df)
-    df = df[
-        df["latitude"].between(*GB_LAT_RANGE) & df["longitude"].between(*GB_LON_RANGE)
-    ]
+    in_gb = df["latitude"].between(*GB_LAT_RANGE) & df["longitude"].between(*GB_LON_RANGE)
+    reject(df[~in_gb], "coordinates_outside_gb_bbox")
+    df = df[in_gb]
     rejections["coordinates_outside_gb_bbox"] = before - len(df)
 
     before = len(df)
     parsed_date = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
     parsed_time = pd.to_datetime(df["time"], format="%H:%M", errors="coerce")
-    df = df.assign(_parsed_date=parsed_date, _parsed_time=parsed_time)
-    df = df.dropna(subset=["_parsed_date", "_parsed_time"])
+    bad_ts = parsed_date.isna() | parsed_time.isna()
+    reject(df[bad_ts], "unparseable_date_or_time")
+    df = df.assign(_parsed_date=parsed_date, _parsed_time=parsed_time)[~bad_ts]
     rejections["unparseable_date_or_time"] = before - len(df)
+
+    # The rejected-record log: one row per dropped collision with the reason,
+    # rewritten each run so it always describes the data currently staged.
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    rejected = (pd.concat(rejected_frames, ignore_index=True) if rejected_frames
+                else pd.DataFrame(columns=REJECT_COLUMNS + ["rejection_reason", "run_id"]))
+    rejected.to_csv(AUDIT_DIR / "rejected_records.csv", index=False)
 
     total_rejected = sum(rejections.values())
     log_event(
@@ -69,7 +89,8 @@ def clean_collisions(df: pd.DataFrame, run_id: str) -> pd.DataFrame:
         message=f"kept {len(df)}/{n0}; rejections={rejections}",
         started_at=started,
     )
-    print(f"[transform] collisions: kept {len(df)}/{n0} ({rejections})")
+    print(f"[transform] collisions: kept {len(df)}/{n0} ({rejections}); "
+          f"{len(rejected)} rejected records written to {AUDIT_DIR / 'rejected_records.csv'}")
     return df
 
 
@@ -108,7 +129,11 @@ def decode_collisions(df: pd.DataFrame) -> pd.DataFrame:
     d["first_road_class"] = lk.decode_series(df["first_road_class"], lk.ROAD_CLASS)
     d["road_type"] = lk.decode_series(df["road_type"], lk.ROAD_TYPE)
     d["speed_limit"] = df["speed_limit"]
-    d["junction_detail"] = lk.decode_series(df["junction_detail"], lk.JUNCTION_DETAIL)
+    d["junction_detail"] = lk.decode_series(
+        lk.combine_junction_detail(df.get("junction_detail_historic", pd.Series(index=df.index)),
+                                   df["junction_detail"]),
+        lk.JUNCTION_DETAIL,
+    )
     d["junction_control"] = lk.decode_series(df["junction_control"], lk.JUNCTION_CONTROL)
     d["second_road_class"] = lk.decode_series(df["second_road_class"], lk.ROAD_CLASS)
     d["pedestrian_crossing"] = lk.decode_series(df["pedestrian_crossing"], lk.PEDESTRIAN_CROSSING)

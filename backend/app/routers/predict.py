@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from ..db import fetch_all, get_connection
 from ..schemas import (
+    DataQualityField,
+    DataQualityReport,
     DriftReport,
     LatencyReport,
     ModelHealth,
@@ -42,7 +44,8 @@ def _find_ml_dir(start: Path) -> Path:
 
 ML_DIR = _find_ml_dir(Path(__file__).resolve())
 sys.path.insert(0, str(ML_DIR))
-from features import FEATURE_COLUMNS, build_features  # noqa: E402
+from features import (CATEGORICAL_VOCAB, FEATURE_COLUMNS, NUMERIC_COLUMNS,  # noqa: E402
+                      build_features_df, encode_category, input_issues)
 
 router = APIRouter(tags=["predict"])
 
@@ -82,11 +85,52 @@ class LatencyTracker:
 latency = LatencyTracker()
 
 
+class InputQualityTracker:
+    """Counts problems in live /predict inputs (missing numerics, categorical
+    values outside the model's vocabulary). In-memory like LatencyTracker."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.with_issues = 0
+        self.counts: dict[str, int] = {}
+
+    def record(self, issues: dict[str, list[str]]) -> None:
+        self.requests += 1
+        flat = [f"missing:{c}" for c in issues["missing_numeric"]] +                [f"unknown:{c}" for c in issues["unknown_category"]]
+        if flat:
+            self.with_issues += 1
+        for key in flat:
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+
+input_quality = InputQualityTracker()
+
+
+def _model_input(df: pd.DataFrame) -> pd.DataFrame:
+    """What the loaded model's predict() expects: raw records for the packaged
+    pipeline, pre-encoded features for a legacy registration."""
+    return build_features_df(df)[FEATURE_COLUMNS] if state.legacy else df
+
+
+def _raw_frame(records: list[dict]) -> pd.DataFrame:
+    """Raw records -> the DataFrame the packaged pipeline expects. Numerics
+    are coerced (the warehouse hands back Decimals, requests may carry None)
+    so MLflow's schema enforcement sees plain floats; the pipeline itself does
+    all feature engineering."""
+    df = pd.DataFrame(records)
+    for col in NUMERIC_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+    return df
+
+
 class ModelState:
     model = None
     version: str | None = None
     stage: str | None = None
     baseline: dict | None = None
+    # True for a model registered before the packaged-pipeline change: it
+    # expects pre-encoded feature columns, so the API encodes for it.
+    legacy: bool = False
 
 
 state = ModelState()
@@ -108,6 +152,14 @@ def load_model() -> None:
         state.model = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}/Production")
         state.version = mv.version
         state.stage = mv.current_stage
+        inner = state.model.unwrap_python_model()
+        state.legacy = not hasattr(inner, "feature_columns")
+        if state.legacy:
+            print("[predict] WARNING: legacy model without bundled preprocessing -- "
+                  "retrain with ml/train.py to register the packaged pipeline")
+        elif inner.vocab != {k: list(v) for k, v in CATEGORICAL_VOCAB.items()}:
+            print("[predict] WARNING: lookup vocabularies changed since this model "
+                  "was trained -- retrain (see ml/RETRAINING.md)")
         print(f"[predict] loaded {MODEL_NAME} v{mv.version} ({mv.current_stage})")
     except Exception as exc:  # noqa: BLE001
         print(f"[predict] could not load model from MLflow: {exc}")
@@ -125,12 +177,13 @@ def _require_model():
 @router.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest):
     model = _require_model()
-    feat = build_features(req.model_dump())
-    row = pd.DataFrame([feat])[FEATURE_COLUMNS]
+    record = req.model_dump()
+    input_quality.record(input_issues(record))
+    row = _raw_frame([record])
 
     started = time.perf_counter()
     try:
-        proba = model.predict(row)
+        proba = model.predict(_model_input(row))
     except Exception as exc:  # noqa: BLE001
         latency.record_failure()
         raise HTTPException(status_code=500, detail=f"Model inference failed: {exc}") from exc
@@ -211,7 +264,7 @@ SEVERITY_LABELS = {1: "Fatal", 2: "Serious", 3: "Slight", -1: "Data missing"}
 
 @router.get("/monitoring/drift", response_model=list[DriftReport])
 async def monitoring_drift(conn: AsyncConnection = Depends(get_connection)):
-    """Feature, location and class drift of the most recent accidents against
+    """Feature, location and class drift of the most recent 100,000 accidents (about one year, so seasons cancel out) against
     the training baseline, all measured as PSI (>0.2 = retrain, per
     ml/RETRAINING.md)."""
     if state.baseline is None:
@@ -230,7 +283,7 @@ async def monitoring_drift(conn: AsyncConnection = Depends(get_connection)):
         -- identical across a bulk load, so ordering by it would return an
         -- arbitrary slice of physical row order rather than a time window.
         ORDER BY d.full_date DESC, fa.accident_index DESC
-        LIMIT 2000
+        LIMIT 100000
     """)
     current = pd.DataFrame(rows)
     reports: list[DriftReport] = []
@@ -239,6 +292,8 @@ async def monitoring_drift(conn: AsyncConnection = Depends(get_connection)):
 
     # --- model input drift ---
     for feature, stats in state.baseline.get("numeric_feature_stats", {}).items():
+        # The window is deliberately ~1 year: weather and month are seasonal,
+        # and a shorter slice would read as drift against the multi-year baseline.
         if feature not in current.columns:
             continue
         psi = _psi(stats["decile_edges"], stats["decile_props"], current[feature])
@@ -280,6 +335,72 @@ async def monitoring_drift(conn: AsyncConnection = Depends(get_connection)):
             ))
 
     return reports
+
+
+SPEED_LIMITS = {20, 30, 40, 50, 60, 70}
+
+
+@router.get("/monitoring/data-quality", response_model=DataQualityReport)
+async def monitoring_data_quality(conn: AsyncConnection = Depends(get_connection)):
+    """Input-data quality: missing/out-of-range numerics and categorical values
+    unseen by the model, for the newest warehouse accidents, plus the same
+    checks tallied over live /predict requests since the backend started."""
+    rows = await fetch_all(conn, """
+        SELECT d.full_date, d.hour, d.day_of_week, d.month, fa.number_of_vehicles,
+               r.speed_limit, r.road_type, r.junction_detail,
+               w.light_conditions, w.weather_conditions, w.road_surface_conditions,
+               w.temperature_c, w.precipitation_mm, l.urban_or_rural_area
+        FROM fact_accidents fa
+        JOIN dim_date d ON d.date_key = fa.date_key
+        JOIN dim_road r ON r.road_id = fa.road_id
+        JOIN dim_weather w ON w.weather_id = fa.weather_id
+        JOIN dim_location l ON l.location_id = fa.location_id
+        ORDER BY d.full_date DESC, fa.accident_index DESC
+        LIMIT 2000
+    """)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No accident data loaded yet")
+    df = _raw_frame(rows)
+    baseline_stats = (state.baseline or {}).get("numeric_feature_stats", {})
+    plausible = {
+        "hour": lambda s: ~s.between(0, 23),
+        "day_of_week": lambda s: ~s.between(1, 7),
+        "month": lambda s: ~s.between(1, 12),
+        "speed_limit": lambda s: ~s.isin(SPEED_LIMITS),
+        "number_of_vehicles": lambda s: s < 1,
+        "temperature_c": lambda s: ~s.between(-30, 45),
+        "precipitation_mm": lambda s: s < 0,
+    }
+    fields: list[DataQualityField] = []
+    for col in NUMERIC_COLUMNS:
+        s = df[col]
+        missing = float(s.isna().mean())
+        base = baseline_stats.get(col, {}).get("missing_rate")
+        invalid = float((plausible[col](s) & s.notna()).mean())
+        fields.append(DataQualityField(
+            field=col, kind="numeric", missing_rate=round(missing, 4),
+            baseline_missing_rate=None if base is None else round(base, 4),
+            invalid_rate=round(invalid, 4),
+            flagged=invalid > 0.05 or (base is not None and missing - base > 0.10)
+                    or (base is None and missing > 0.25),
+        ))
+    for field in CATEGORICAL_VOCAB:
+        unknown_idx = len(CATEGORICAL_VOCAB[field])
+        codes = df[field].map(lambda v: encode_category(field, v))
+        unknown = float((codes == unknown_idx).mean())
+        missing = float(df[field].isna().mean())
+        fields.append(DataQualityField(
+            field=field, kind="categorical", missing_rate=round(missing, 4),
+            invalid_rate=round(unknown, 4), flagged=unknown > 0.05,
+        ))
+    return DataQualityReport(
+        window_size=len(df),
+        window_start=str(df["full_date"].min()), window_end=str(df["full_date"].max()),
+        fields=fields,
+        live_requests=input_quality.requests,
+        live_requests_with_issues=input_quality.with_issues,
+        live_issue_counts=input_quality.counts,
+    )
 
 
 @router.get("/monitoring/latency", response_model=LatencyReport)
@@ -324,10 +445,10 @@ async def monitoring_performance(conn: AsyncConnection = Depends(get_connection)
         raise HTTPException(status_code=404, detail="No accident data loaded yet")
 
     df = pd.DataFrame(rows)
-    X = pd.DataFrame([build_features(r) for r in df.to_dict("records")])[FEATURE_COLUMNS]
+    X = _raw_frame(df.to_dict("records"))
     y_true = df["severity_id"].tolist()
 
-    proba = np.asarray(model.predict(X))
+    proba = np.asarray(model.predict(_model_input(X)))
     labels = state.baseline["class_labels"] if state.baseline else sorted(set(y_true))
     y_pred = [labels[int(np.argmax(p))] for p in proba] if proba.ndim == 2 else proba.tolist()
 

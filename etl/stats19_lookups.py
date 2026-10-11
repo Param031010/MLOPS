@@ -239,6 +239,40 @@ JOURNEY_PURPOSE = {
 VEHICLE_LEFT_HAND_DRIVE = {1: "No", 2: "Yes", 9: "Not known", -1: "Data missing"}
 
 
+# ---------------------------------------------------------------------------
+# Scheme changes in the DfT "last 5 years" export (found by the data-quality
+# monitor: ~45% of collisions decoded as "Unknown code N").
+#
+# 1. junction_detail: the file carries both `junction_detail_historic` (codes
+#    0-9, the scheme above; -1 for the newest years) and a new-scheme
+#    `junction_detail` that renumbers the junction types. The mapping below was
+#    verified by cross-tabulating the two columns in the raw data: new 13 <->
+#    historic 3 (104,157 rows), 16 <-> 6 (34,205), 17 <-> 7, 18 <-> 8, 19 <-> 9.
+#    Aliasing the new codes onto the old labels keeps one vocabulary across all
+#    years instead of leaving 2021-2025 data undecoded.
+JUNCTION_DETAIL_NEW_TO_HISTORIC = {13: 3, 16: 6, 17: 7, 18: 8, 19: 9}
+
+# 2. STATS19 uses 9 / 99 for "unknown (self reported)" in many fields; the
+#    dictionaries above only listed the numbered categories.
+UNKNOWN_SELF_REPORTED = "Unknown (self reported)"
+for _lookup in (JUNCTION_DETAIL, JUNCTION_CONTROL, ROAD_CLASS, SPECIAL_CONDITIONS_AT_SITE,
+                ROAD_SURFACE_CONDITIONS, BUS_OR_COACH_PASSENGER, TOWING_AND_ARTICULATION,
+                JUNCTION_LOCATION, SKIDDING_AND_OVERTURNING, FIRST_POINT_OF_IMPACT,
+                WEATHER_CONDITIONS, LIGHT_CONDITIONS):
+    _lookup.setdefault(9, UNKNOWN_SELF_REPORTED)
+for _lookup in (JUNCTION_DETAIL, PEDESTRIAN_CROSSING, CARRIAGEWAY_HAZARDS, VEHICLE_MANOEUVRE):
+    _lookup.setdefault(99, UNKNOWN_SELF_REPORTED)
+
+
+def combine_junction_detail(historic: pd.Series, current: pd.Series) -> pd.Series:
+    """One junction_detail code per row, in the historic scheme: the historic
+    column where it is populated, otherwise the new-scheme code translated."""
+    hist = pd.to_numeric(historic, errors="coerce")
+    new = pd.to_numeric(current, errors="coerce")
+    new_as_historic = new.map(JUNCTION_DETAIL_NEW_TO_HISTORIC).fillna(new)
+    return hist.where(hist.notna() & (hist != -1), new_as_historic)
+
+
 def decode(lookup: dict, code) -> str:
     """Decode a single STATS19 code; unmapped/NaN codes never raise."""
     if pd.isna(code):

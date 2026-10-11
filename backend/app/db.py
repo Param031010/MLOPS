@@ -50,3 +50,28 @@ async def fetch_all(conn: AsyncConnection, sql: str, params: dict | None = None)
 async def fetch_one(conn: AsyncConnection, sql: str, params: dict | None = None) -> dict | None:
     rows = await fetch_all(conn, sql, params)
     return rows[0] if rows else None
+
+
+def mart_filters(severity: list[int] | None = None, year_from: int | None = None,
+                 year_to: int | None = None, **extra: list[str] | None) -> tuple[str, dict]:
+    """WHERE clause + params for the optional dashboard filters on a mart.
+
+    Every value is bound as a parameter; `extra` maps a column name to a list
+    of allowed values (column names come from code, never from the request).
+    """
+    clauses: list[str] = []
+    params: dict = {}
+    if severity:
+        clauses.append("severity_id = ANY(:severity)")
+        params["severity"] = list(severity)
+    if year_from is not None:
+        clauses.append("year >= :year_from")
+        params["year_from"] = year_from
+    if year_to is not None:
+        clauses.append("year <= :year_to")
+        params["year_to"] = year_to
+    for col, values in extra.items():
+        if values:
+            clauses.append(f"{col} = ANY(:{col})")
+            params[col] = list(values)
+    return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params

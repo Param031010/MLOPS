@@ -192,3 +192,24 @@ class PerformanceReport(BaseModel):
     recall_macro: Optional[float] = None
     false_negative_rate_fatal_serious: Optional[float] = None
     sample_size: int
+
+
+class DataQualityField(BaseModel):
+    field: str
+    kind: str  # numeric | categorical
+    missing_rate: float
+    baseline_missing_rate: Optional[float] = None
+    # numeric: share outside the plausible range; categorical: share of
+    # values the model's vocabulary has never seen
+    invalid_rate: float
+    flagged: bool
+
+
+class DataQualityReport(BaseModel):
+    window_size: int
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
+    fields: list[DataQualityField]
+    live_requests: int
+    live_requests_with_issues: int
+    live_issue_counts: dict[str, int]

@@ -122,3 +122,32 @@ if lat:
         l4.metric("Failures", f"{lat['failures']:,}", delta=f"{lat['failure_rate']:.1%} of requests",
                   delta_color="inverse")
         st.dataframe(pd.DataFrame([lat]), use_container_width=True, hide_index=True)
+
+# -------------------------------------------------------------- data quality
+st.divider()
+st.subheader("Input-data quality")
+st.caption("Missing, out-of-range and unseen-category rates for the newest warehouse accidents "
+           "(vs the training baseline), plus the same checks over live `POST /predict` inputs.")
+try:
+    dq = get("/monitoring/data-quality")
+except ApiError as exc:
+    st.error(str(exc))
+    dq = None
+
+if dq:
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Warehouse rows checked", f"{dq['window_size']:,}")
+    q2.metric("Live requests checked", f"{dq['live_requests']:,}")
+    q3.metric("Live requests with issues", f"{dq['live_requests_with_issues']:,}")
+    dq_df = pd.DataFrame(dq["fields"])
+    fig = px.bar(dq_df.melt(id_vars=["field", "flagged"],
+                            value_vars=["missing_rate", "invalid_rate"],
+                            var_name="check", value_name="rate"),
+                 x="field", y="rate", color="check", barmode="group",
+                 labels={"rate": "share of rows", "field": ""})
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(dq_df, use_container_width=True, hide_index=True)
+    if dq_df["flagged"].any():
+        st.error("Input quality has degraded on: " + ", ".join(dq_df.loc[dq_df["flagged"], "field"]))
+    if dq["live_issue_counts"]:
+        st.caption("Live issue tally: " + ", ".join(f"{k} x{v}" for k, v in dq["live_issue_counts"].items()))

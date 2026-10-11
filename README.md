@@ -83,7 +83,13 @@ Star schema, built by `sql/schema.sql`:
 - **`etl_audit_log`** — source, row count, rejected count, status per
   pipeline run; mirrored to `etl/data/audit/audit_log.jsonl`.
 - Ten `mart_*` materialized views back every dashboard page, refreshed at the
-  end of every `load.py` run.
+  end of every `load.py` run. Seven of them carry a `year` column so the API
+  can filter by year range (and severity) server-side; `mart_weather_impact`
+  stores sums + non-null counts instead of averages so a multi-year average
+  is computed correctly rather than as an average of averages.
+- **`vw_model_features`** — a plain (non-materialized) view: one row per
+  collision with every field the severity classifier consumes, resolved
+  through the dimensions. `ml/train.py` reads exactly this object.
 
 ## 6. Pipeline workflow
 
@@ -103,7 +109,14 @@ Star schema, built by `sql/schema.sql`:
    unparseable dates; decodes STATS19 codes into labels; joins weather (grid
    cell + exact hour) and road context (exact coordinate); restricts
    casualties/vehicles to accidents that survived cleaning; logs every
-   rejection and reason.
+   rejection and reason, and writes each dropped collision (with its
+   rejection reason) to `etl/data/audit/rejected_records.csv`.
+   - **Junction-detail reconciliation**: the DfT "last 5 years" export carries
+     both a historic `junction_detail_historic` column and a renumbered
+     `junction_detail`. `stats19_lookups.combine_junction_detail` maps the new
+     codes onto the historic labels (verified by cross-tabulating the raw
+     columns), and `9`/`99` "unknown (self reported)" codes are labeled — this
+     fixed ~45% of collisions that previously decoded as "Unknown code N".
 3. **`load.py`** — bulk-loads staging parquet into the warehouse in one
    transaction (dimensions first, then facts upserted against them), commits,
    refreshes all mart views, and prints final row counts as pipeline-success
@@ -141,10 +154,27 @@ honestly (`/accidents/overview`, dashboard home page), not hidden.
 | `GET /monitoring/drift` | Feature/label drift vs training baseline |
 | `GET /monitoring/performance` | Rolling recall/macro-F1/false-negative rate |
 | `GET /monitoring/latency` | Serving latency (p50/p95) and failure rate |
+| `GET /monitoring/data-quality` | Missing / out-of-range / unseen-category rates, warehouse window + live `/predict` inputs |
+
+**Server-side filters.** The mart-backed endpoints (`/accidents/by-hour`,
+`monthly-trend`, `weather-impact`, `road-type-severity`, `/casualties/by-type`,
+`/casualties/demographics`, `/vehicles/by-type`) accept repeatable
+`severity`, plus `year_from` / `year_to`; `road-type-severity` also accepts
+repeatable `road_type`. All values are bound parameters. The dashboard's
+sidebar filters re-query these, so filtering happens in Postgres, not in the
+browser.
 
 Data endpoints return `503` with a readable message until `DATABASE_URL` is
 configured and reachable; `/predict` and `/model/*` return `503` until a
 Production model is loaded.
+
+**Monitoring windows.** `/monitoring/drift` scores the ~100,000 most recent
+accidents (about one year, so seasonal weather/month shifts don't read as
+drift against the multi-year baseline); `/monitoring/performance` scores the
+1,000 most recent; `/monitoring/data-quality` checks the 2,000 newest
+warehouse rows plus every live `/predict` input since the backend started.
+Latency, failure and input-quality counters are in-process and reset on
+restart.
 
 ## 8. Dashboard (Streamlit, 8 pages)
 
@@ -158,30 +188,54 @@ Production model is loaded.
 | `5_Hotspot_Map.py` | pydeck map, live severity/date filters |
 | `6_Casualties_Vehicles.py` | Casualty type, demographics, vehicle type |
 | `7_Severity_Predictor.py` | Form → `POST /predict` → predicted class + probabilities |
-| `8_Model_Monitoring.py` | Drift and performance charts from `/monitoring/*` |
+| `8_Model_Monitoring.py` | Rolling performance, drift (feature/location/class PSI), input-data quality, and serving latency from `/monitoring/*` |
 
-Every page queries the live API — no bundled or placeholder data — and a
-panel with no rows says so rather than rendering empty.
+Pages 1–4 and 6 share one sidebar (`api_client.sidebar_filters`: year range +
+severity; page 4 adds road type) that is passed to the API as query
+parameters. Every page queries the live API — no bundled or placeholder
+data — and a panel with no rows says so rather than rendering empty.
 
 ## 9. Part 2 — MLOps
 
+- **Data**: `ml/train.py` reads `vw_model_features` (one row per collision).
 - **Models**: Random Forest, XGBoost, LightGBM, trained with class weighting
   to address severity-class imbalance (fatal collisions are rare).
-- **Split**: chronological — earlier years train, most recent years
+- **Split**: chronological 70/15/15 — earlier years train, most recent years
   validate/test — since the model predicts future accidents, not
   exchangeable historical rows.
-- **Tracking**: every run's parameters, metrics, and artifacts logged to
-  MLflow; the macro-F1 winner is registered as `traffic_severity_classifier`
-  and staged `Production`.
-- **Evaluation**: `evaluate.py` produces recall, macro-F1, and a confusion
-  matrix as MLflow artifacts.
+- **Tracking**: every run's parameters, metrics, and artifacts are logged to
+  the MLflow experiment `traffic-accident-severity`; the validation-macro-F1
+  winner is registered as `traffic_severity_classifier`, staged
+  `Production`, and the previous Production version is archived.
+- **Packaged inference artifact**: the winner is wrapped in
+  `ml/pipeline.py`'s `SeverityPipeline`, so the registered model takes *raw*
+  accident records and does its own feature engineering via
+  `ml/features.py`. Training, `/predict` and the Docker image therefore can't
+  be fed differently-preprocessed data. A model registered before this change
+  is detected as "legacy" and still served (the API encodes for it), with a
+  warning to retrain.
+- **Evaluation**: `ml/reporting.py` (shared by `train.py` and `evaluate.py`)
+  logs macro-F1, macro and per-class recall, the Fatal/Serious
+  false-negative rate, a confusion-matrix PNG + CSV and the classification
+  report for every candidate run. `evaluate.py` re-scores the current
+  Production model on the held-out test slice as a separate MLflow run.
+- **Baseline**: `ml/artifacts/baseline.json` stores feature and location
+  decile profiles, the class mix and missing rates from the training split;
+  the monitoring endpoints compare live data against it.
 - **Serving**: the backend loads the Production model at startup via a
   `lifespan` handler; restart the backend after training so it picks up a
-  newly promoted model.
-- **Monitoring**: `/monitoring/drift` and `/monitoring/performance` compare
-  live traffic against the training baseline.
+  newly promoted model. Serving warns if the lookup vocabularies changed
+  since training.
+- **Monitoring**: `/monitoring/drift` (feature, location, class PSI),
+  `/monitoring/performance`, `/monitoring/data-quality` (missing,
+  out-of-range, unseen-category rates), and `/monitoring/latency`.
 - **Retraining criteria**: documented concretely in `ml/RETRAINING.md`
-  (macro-F1 drop, false-negative rate, and feature drift PSI thresholds).
+  (macro-F1 drop, false-negative rate, PSI > 0.2, input-data quality, new
+  data volume), along with the model lifecycle and rollback procedure.
+- **Current model**: Random Forest, registered version 4 (trained
+  2026-10-11), test macro-F1 ≈ 0.36, macro recall ≈ 0.46. The classes are
+  heavily imbalanced (Slight ≈ 76%, Serious ≈ 22%, Fatal ≈ 1.5% of
+  training rows); exact figures are in `ml/artifacts/baseline.json`.
 
 ## 10. Setup and run order
 
@@ -204,6 +258,7 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
 .venv/Scripts/python extract.py         # --skip-road / --road-limit N as needed
 .venv/Scripts/python transform.py
 .venv/Scripts/python load.py            # final row counts = pipeline-success screenshot
+.venv/Scripts/python quality_check.py   # post-load gate: exit 0 = warehouse healthy
 
 # 4. API (own virtualenv)
 cd ../backend
@@ -262,12 +317,14 @@ identical absolute path sidesteps that entirely. This was hit and fixed
 while producing the container run-test evidence below — adjust the path to
 match wherever you clone this repo.
 
-Verified working (2026-09-08): built `traffic-severity-api:latest`, ran it
+Verified working (2026-09-08, against the model registered at that time —
+Production v2, macro-F1 0.378): built `traffic-severity-api:latest`, ran it
 against the host Postgres with `ml/mlruns` mounted as above, and confirmed
-`/health`, `/model/info` (`RandomForest`, Production v2, macro-F1 0.378),
-`/model/health`, a real `/predict` call, and `/accidents/overview` (mart
-read through the host DB) all returned correctly from inside the
-container.
+`/health`, `/model/info`, `/model/health`, a real `/predict` call, and
+`/accidents/overview` (mart read through the host DB) all returned correctly
+from inside the container. The API, packaged-pipeline model (v4) and
+`/monitoring/data-quality` added since have not been re-run in the container;
+rebuild the image and repeat the checks before using it as fresh evidence.
 
 ### Airflow (optional orchestration)
 
@@ -342,12 +399,13 @@ shim, so no DAG code changes were needed.
 ├── backend/app/                # FastAPI app, routers, db.py, models.py
 ├── backend/Dockerfile          # containerizes only the inference API
 ├── dashboard/                  # Home.py + 8-page multi-page app
-├── ml/                         # features.py, train.py, evaluate.py, RETRAINING.md
-├── sql/schema.sql
-├── airflow/dags/                # optional Airflow DAG wrapping the ETL scripts
-├── docs/                        # DATA_DICTIONARY.md, architecture-diagram.svg
+├── ml/                         # features.py, pipeline.py, reporting.py, train.py, evaluate.py, RETRAINING.md
+├── sql/schema.sql              # star schema, 10 marts, vw_model_features
+├── airflow/                    # optional Airflow DAG wrapping the ETL scripts + WSL2 README
+├── docs/                       # DATA_DICTIONARY.md, REPORT_OUTLINE.md, architecture-diagram.svg, generate_data_dictionary.py
 ├── .dockerignore
 ├── .env.example
 ├── CLAUDE.md                   # full build spec
+├── DETAILED_README.md          # function- and column-level technical reference
 └── README.md                   # this file
 ```

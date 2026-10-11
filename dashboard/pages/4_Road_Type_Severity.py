@@ -2,26 +2,28 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from api_client import ApiError, get
+from api_client import ApiError, get, sidebar_filters
 
 st.set_page_config(page_title="Road Type & Severity", page_icon="\U0001F6E3", layout="wide")
 st.title("Road Type vs Severity")
 
 try:
-    rows = get("/accidents/road-type-severity")
+    params = sidebar_filters()
+    all_road_types = sorted({r["road_type"] for r in get("/accidents/road-type-severity")})
+    chosen_roads = st.sidebar.multiselect("Road type", all_road_types, default=all_road_types)
+    if chosen_roads and len(chosen_roads) < len(all_road_types):
+        params["road_type"] = chosen_roads
+    rows = get("/accidents/road-type-severity", params=params)
 except ApiError as exc:
     st.error(str(exc))
     st.stop()
 
 df = pd.DataFrame(rows)
 if df.empty:
-    st.info("No data yet -- run the ETL pipeline.")
+    st.info("No data for these filters -- widen them or run the ETL pipeline.")
     st.stop()
 
-severities = sorted(df["severity_label"].unique())
-selected = st.sidebar.multiselect("Severity", severities, default=severities)
 normalize = st.sidebar.checkbox("Show as % within road type", value=False)
-df = df[df["severity_label"].isin(selected)]
 
 if normalize:
     totals = df.groupby("road_type")["accident_count"].transform("sum")
