@@ -27,3 +27,6 @@ venv/
 
 # local assistant instructions
 CLAUDE.md
+
+# runtime logs
+*.log

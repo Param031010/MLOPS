@@ -176,24 +176,19 @@ warehouse rows plus every live `/predict` input since the backend started.
 Latency, failure and input-quality counters are in-process and reset on
 restart.
 
-## 8. Dashboard (Streamlit, 8 pages)
+## 8. Dashboard (Streamlit, 4 pages)
 
 | Page | Contents |
 |---|---|
-| `Home.py` | KPI strip (from `/accidents/overview`), navigation, honest enrichment-coverage callout |
-| `1_Severity_Distribution.py` | Severity split, interactive |
-| `2_Time_Patterns.py` | Hour × weekday heatmap, monthly trend |
-| `3_Weather_Impact.py` | Weather condition vs severity |
-| `4_Road_Type_Severity.py` | Road type vs severity |
-| `5_Hotspot_Map.py` | pydeck map, live severity/date filters |
-| `6_Casualties_Vehicles.py` | Casualty type, demographics, vehicle type |
-| `7_Severity_Predictor.py` | Form → `POST /predict` → predicted class + probabilities |
-| `8_Model_Monitoring.py` | Rolling performance, drift (feature/location/class PSI), input-data quality, and serving latency from `/monitoring/*` |
+| `Home.py` | Overview: KPI strip, severity mix, hour × weekday heatmap, monthly trend, enrichment-coverage expander |
+| `1_Risk_Factors.py` | Tabs: weather vs severity, road type vs severity, casualty age/sex and vehicle type |
+| `2_Hotspot_Map.py` | pydeck map with live severity/date filters, top locations in an expander |
+| `3_Severity_Model.py` | Tabs: prediction form → `POST /predict` with probabilities; monitoring (rolling performance, PSI drift, latency, input-data quality) |
 
-Pages 1–4 and 6 share one sidebar (`api_client.sidebar_filters`: year range +
-severity; page 4 adds road type) that is passed to the API as query
-parameters. Every page queries the live API — no bundled or placeholder
-data — and a panel with no rows says so rather than rendering empty.
+Home and Risk Factors share one sidebar (`api_client.sidebar_filters`: year
+range + severity) that is passed to the API as query parameters. Every page
+queries the live API — no bundled or placeholder data — and a panel with no
+rows says so rather than rendering empty.
 
 ## 9. Part 2 — MLOps
 

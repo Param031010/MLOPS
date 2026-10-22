@@ -66,9 +66,9 @@ st.pydeck_chart(pdk.Deck(
     map_style=None,
 ))
 
-st.subheader("Top locations by accident count")
-try:
-    top_rows = get("/accidents/top-locations", params={"limit": 20})
-    st.dataframe(pd.DataFrame(top_rows), use_container_width=True, hide_index=True)
-except ApiError as exc:
-    st.error(str(exc))
+with st.expander("Top 20 locations by accident count"):
+    try:
+        top_rows = get("/accidents/top-locations", params={"limit": 20})
+        st.dataframe(pd.DataFrame(top_rows), use_container_width=True, hide_index=True)
+    except ApiError as exc:
+        st.error(str(exc))
